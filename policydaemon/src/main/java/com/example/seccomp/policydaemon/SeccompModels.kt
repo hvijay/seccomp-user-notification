@@ -6,6 +6,16 @@ data class PendingRequest(
     val pid: Int,
     val syscallNr: Int,
     val description: String,
+    val ioctlCmd: Long,
+    val targetPid: Int,
+    val cgroupPath: String,
+    val monitorStatus: String,
+    val binderInterface: String,
+    val binderCode: Int,
+    val targetHandle: Int,
+    val intentAction: String,
+    val intentUri: String,
+    val parcelTruncated: Boolean,
 )
 
 data class RepositoryState(

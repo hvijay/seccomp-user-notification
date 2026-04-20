@@ -5,3 +5,5 @@ policydaemon.log
 
 **/build/
 **/.cxx/
+kernel/*.bpf.o
+kernel/*.skel.h

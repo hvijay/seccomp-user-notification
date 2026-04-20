@@ -12,7 +12,7 @@
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="This app installs a seccomp user-notify filter for openat(), forks a child, and hands the listener FD to the policy daemon."
+            android:text="This app installs a seccomp user-notify filter for ioctl(BINDER_WRITE_READ), forks a child, and has native code send a broadcast intent so the policy daemon can correlate the seccomp stop with Binder metadata."
             android:textAppearance="?attr/textAppearanceBodyLarge" />
 
         <Button
@@ -35,7 +35,7 @@
             android:layout_height="wrap_content"
             android:layout_marginTop="12dp"
             android:enabled="false"
-            android:text="Install filter + fork child" />
+            android:text="Install filter + fork native Binder child" />
 
         <TextView
             android:id="@+id/statusText"

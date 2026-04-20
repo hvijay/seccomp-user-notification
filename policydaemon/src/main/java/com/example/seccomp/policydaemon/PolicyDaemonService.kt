@@ -26,9 +26,10 @@ class PolicyDaemonService : Service() {
             sessionId: String,
             listenerFd: android.os.ParcelFileDescriptor,
             description: String,
+            targetPid: Int,
         ): Boolean {
             val rawFd = listenerFd.detachFd()
-            return SeccompRepository.registerSession(sessionId, rawFd, description)
+            return SeccompRepository.registerSession(sessionId, rawFd, description, targetPid)
         }
 
         override fun unregisterSession(sessionId: String) {

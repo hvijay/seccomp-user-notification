@@ -104,11 +104,16 @@ class MainActivity : AppCompatActivity() {
         demoInFlight = true
         lastResultMessage = null
         binding.startDemoButton.isEnabled = false
-        updateStatus("Installing filter on helper thread and forking child...")
+        updateStatus("Installing Binder ioctl filter, forking child, and issuing a native broadcast intent...")
 
         lifecycleScope.launch {
             val result = withContext(Dispatchers.IO) {
-                NativeSeccompBridge.installFilterForkAndTrigger("/proc/version")
+                NativeSeccompBridge.installFilterForkAndTriggerIntent(
+                    ServiceContract.DEMO_NATIVE_ACTION,
+                    ServiceContract.DEMO_PACKAGE,
+                    "",
+                    "https://example.com/seccomp-poc",
+                )
             }
 
             if (result.size < 2) {
@@ -129,11 +134,12 @@ class MainActivity : AppCompatActivity() {
             }
 
             val sessionId = "session-${System.currentTimeMillis()}"
-            val description = "Intercept openat(\"/proc/version\") from forked child pid=$childPid"
+            val description =
+                "Intercept ioctl(BINDER_WRITE_READ) from forked child pid=$childPid while it sends a native broadcast Intent."
 
             val registered = runCatching {
                 ParcelFileDescriptor.adoptFd(listenerFd).use { pfd ->
-                    currentDaemon.registerSession(sessionId, pfd, description)
+                    currentDaemon.registerSession(sessionId, pfd, description, childPid)
                 }
             }.getOrElse { error ->
                 updateStatus("Failed to send listener FD to daemon: ${error.message}")
@@ -142,7 +148,7 @@ class MainActivity : AppCompatActivity() {
 
             updateStatus(
                 if (registered) {
-                    "Listener handed to daemon. Review request in policy daemon app for child pid=$childPid."
+                    "Listener handed to daemon. Review Binder ioctl request in policy daemon app for child pid=$childPid."
                 } else {
                     "Daemon rejected the listener registration."
                 },

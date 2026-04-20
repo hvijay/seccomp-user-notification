@@ -1,6 +1,9 @@
 package com.example.seccomp.shared
 
 object ServiceContract {
+    const val DEMO_PACKAGE = "com.example.seccomp.demoapp"
+    const val DEMO_ACTIVITY = "com.example.seccomp.demoapp.MainActivity"
+    const val DEMO_NATIVE_ACTION = "com.example.seccomp.demoapp.NATIVE_POC"
     const val DAEMON_PACKAGE = "com.example.seccomp.policydaemon"
     const val DAEMON_ACTIVITY = "com.example.seccomp.policydaemon.MainActivity"
     const val DAEMON_SERVICE = "com.example.seccomp.policydaemon.PolicyDaemonService"

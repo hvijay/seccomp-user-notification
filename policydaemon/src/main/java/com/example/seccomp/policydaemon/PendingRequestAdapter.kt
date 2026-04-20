@@ -31,9 +31,39 @@ class PendingRequestAdapter(
         private val onDeny: (PendingRequest) -> Unit,
     ) : RecyclerView.ViewHolder(binding.root) {
         fun bind(item: PendingRequest) {
-            binding.titleText.text = "pid=${item.pid}, syscall=${item.syscallNr}"
-            binding.bodyText.text =
-                "${item.description}\nnotificationId=${item.notificationId}\nsession=${item.sessionId}"
+            val header = buildString {
+                append("tid=${item.pid}, targetPid=${item.targetPid}, syscall=${item.syscallNr}")
+                if (item.binderCode != 0 || item.binderInterface.isNotEmpty()) {
+                    append(", code=${item.binderCode}")
+                }
+            }
+            val body = buildString {
+                appendLine(item.description)
+                appendLine("notificationId=${item.notificationId}")
+                appendLine("session=${item.sessionId}")
+                appendLine("ioctlCmd=0x${item.ioctlCmd.toString(16)}")
+                appendLine("monitor=${item.monitorStatus}")
+                if (item.cgroupPath.isNotEmpty()) {
+                    appendLine("cgroup=${item.cgroupPath}")
+                }
+                if (item.binderInterface.isNotEmpty()) {
+                    appendLine("interface=${item.binderInterface}")
+                }
+                if (item.targetHandle != 0) {
+                    appendLine("targetHandle=${item.targetHandle}")
+                }
+                if (item.intentAction.isNotEmpty()) {
+                    appendLine("intentAction=${item.intentAction}")
+                }
+                if (item.intentUri.isNotEmpty()) {
+                    appendLine("intentUri=${item.intentUri}")
+                }
+                if (item.parcelTruncated) {
+                    append("parcelTruncated=true")
+                }
+            }.trim()
+            binding.titleText.text = header
+            binding.bodyText.text = body
             binding.allowButton.setOnClickListener { onAllow(item) }
             binding.denyButton.setOnClickListener { onDeny(item) }
         }

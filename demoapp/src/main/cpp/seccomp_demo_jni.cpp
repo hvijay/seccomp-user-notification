@@ -1,5 +1,5 @@
-#include <android/log.h>
 #include <jni.h>
+#include <linux/android/binder.h>
 #include <linux/audit.h>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
@@ -8,6 +8,7 @@
 #include <pthread.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
@@ -16,6 +17,7 @@
 
 #include <array>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -34,16 +36,27 @@ struct WorkerResult {
 };
 
 struct WorkerArgs {
-    std::string path;
+    std::string action;
+    std::string target_package;
+    std::string target_component;
+    std::string data_uri;
     WorkerResult* result;
 };
 
 int InstallUserNotifyFilter() {
+    constexpr uint32_t kBinderWriteReadLow = static_cast<uint32_t>(BINDER_WRITE_READ);
+    constexpr uint32_t kBinderWriteReadHigh = static_cast<uint32_t>(
+            static_cast<uint64_t>(BINDER_WRITE_READ) >> 32U);
+
     sock_filter filter[] = {
         BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, arch)),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, kAuditArch, 0, 3),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, kAuditArch, 0, 7),
         BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, nr)),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_openat, 0, 1),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_ioctl, 0, 5),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, args[1])),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, kBinderWriteReadLow, 0, 3),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, args[1]) + 4),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, kBinderWriteReadHigh, 0, 1),
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF),
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
     };
@@ -63,6 +76,42 @@ int InstallUserNotifyFilter() {
         return -errno;
     }
     return fd;
+}
+
+[[noreturn]] void ExecBroadcastIntent(const WorkerArgs& args, int write_fd) {
+    TEMP_FAILURE_RETRY(dup2(write_fd, STDOUT_FILENO));
+    TEMP_FAILURE_RETRY(dup2(write_fd, STDERR_FILENO));
+    if (write_fd != STDOUT_FILENO && write_fd != STDERR_FILENO) {
+        close(write_fd);
+    }
+
+    std::vector<char*> argv;
+    argv.push_back(const_cast<char*>("/system/bin/am"));
+    argv.push_back(const_cast<char*>("broadcast"));
+    argv.push_back(const_cast<char*>("-a"));
+    argv.push_back(const_cast<char*>(args.action.c_str()));
+    if (!args.data_uri.empty()) {
+        argv.push_back(const_cast<char*>("-d"));
+        argv.push_back(const_cast<char*>(args.data_uri.c_str()));
+    }
+    if (!args.target_package.empty()) {
+        argv.push_back(const_cast<char*>("-p"));
+        argv.push_back(const_cast<char*>(args.target_package.c_str()));
+    }
+    if (!args.target_component.empty()) {
+        argv.push_back(const_cast<char*>("-n"));
+        argv.push_back(const_cast<char*>(args.target_component.c_str()));
+    }
+    argv.push_back(const_cast<char*>("--es"));
+    argv.push_back(const_cast<char*>("source"));
+    argv.push_back(const_cast<char*>("native-fork-child"));
+    argv.push_back(nullptr);
+
+    execv(argv[0], argv.data());
+
+    const std::string message = "execv(/system/bin/am) failed. errno=" + std::to_string(errno) + "\n";
+    TEMP_FAILURE_RETRY(write(STDERR_FILENO, message.data(), message.size()));
+    _exit(errno == 0 ? 127 : errno);
 }
 
 void* WorkerMain(void* opaque) {
@@ -97,33 +146,8 @@ void* WorkerMain(void* opaque) {
 
     if (pid == 0) {
         close(result_pipe[0]);
-
-        long fd = syscall(__NR_openat, AT_FDCWD, args->path.c_str(), O_RDONLY | O_CLOEXEC, 0);
-        if (fd >= 0) {
-            std::array<char, 4096> buffer{};
-            const ssize_t read_count = TEMP_FAILURE_RETRY(read(static_cast<int>(fd), buffer.data(),
-                                                               buffer.size() - 1));
-            syscall(__NR_close, fd);
-            if (read_count >= 0) {
-                static constexpr char kPrefix[] = "OK\n";
-                TEMP_FAILURE_RETRY(write(result_pipe[1], kPrefix, sizeof(kPrefix) - 1));
-                if (read_count > 0) {
-                    TEMP_FAILURE_RETRY(write(result_pipe[1], buffer.data(), read_count));
-                }
-            } else {
-                const std::string message = "ERR\nRead failed after allow. errno=" +
-                                            std::to_string(errno) + "\n";
-                TEMP_FAILURE_RETRY(write(result_pipe[1], message.data(), message.size()));
-            }
-            close(result_pipe[1]);
-            _exit(0);
-        }
-
-        const std::string message =
-                "ERR\nRequest blocked or syscall failed. errno=" + std::to_string(errno) + "\n";
-        TEMP_FAILURE_RETRY(write(result_pipe[1], message.data(), message.size()));
-        close(result_pipe[1]);
-        _exit(errno == 0 ? 1 : errno);
+        close(listener_fd);
+        ExecBroadcastIntent(*args, result_pipe[1]);
     }
 
     close(result_pipe[1]);
@@ -133,20 +157,32 @@ void* WorkerMain(void* opaque) {
     return nullptr;
 }
 
+std::string CopyJString(JNIEnv* env, jstring value, const char* fallback) {
+    if (value == nullptr) {
+        return fallback;
+    }
+    const char* raw = env->GetStringUTFChars(value, nullptr);
+    std::string out = raw != nullptr ? raw : fallback;
+    if (raw != nullptr) {
+        env->ReleaseStringUTFChars(value, raw);
+    }
+    return out;
+}
+
 }  // namespace
 
 extern "C" JNIEXPORT jintArray JNICALL
-Java_com_example_seccomp_demoapp_NativeSeccompBridge_installFilterForkAndTrigger(
-        JNIEnv* env, jclass, jstring path_j) {
-    const char* raw_path = env->GetStringUTFChars(path_j, nullptr);
+Java_com_example_seccomp_demoapp_NativeSeccompBridge_installFilterForkAndTriggerIntent(
+        JNIEnv* env, jclass, jstring action_j, jstring target_package_j,
+        jstring target_component_j, jstring data_uri_j) {
     WorkerResult result;
     WorkerArgs args{
-        .path = raw_path != nullptr ? raw_path : "/proc/version",
+        .action = CopyJString(env, action_j, "com.example.seccomp.demoapp.NATIVE_POC"),
+        .target_package = CopyJString(env, target_package_j, "com.example.seccomp.demoapp"),
+        .target_component = CopyJString(env, target_component_j, ""),
+        .data_uri = CopyJString(env, data_uri_j, "https://example.com/seccomp-poc"),
         .result = &result,
     };
-    if (raw_path != nullptr) {
-        env->ReleaseStringUTFChars(path_j, raw_path);
-    }
 
     pthread_t thread;
     const int create_rc = pthread_create(&thread, nullptr, &WorkerMain, &args);
@@ -189,16 +225,11 @@ Java_com_example_seccomp_demoapp_NativeSeccompBridge_readChildResult(
     }
     close(read_fd);
 
-    if (output.rfind("OK\n", 0) == 0) {
-        const std::string message = "Allowed. /proc/version contents:\n" + output.substr(3);
-        return env->NewStringUTF(message.c_str());
-    }
-    if (output.rfind("ERR\n", 0) == 0) {
-        const std::string message = "Blocked or failed:\n" + output.substr(4);
-        return env->NewStringUTF(message.c_str());
-    }
     if (output.empty()) {
-        return env->NewStringUTF("Child exited without reporting a result.");
+        return env->NewStringUTF(
+                "Child exited without producing any command output. If the request was denied, inspect logcat for the `am broadcast` failure.");
     }
-    return env->NewStringUTF(output.c_str());
+
+    const std::string message = "Forked child command output:\n" + output;
+    return env->NewStringUTF(message.c_str());
 }
