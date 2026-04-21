@@ -16,6 +16,22 @@
 #define TRANSACTION_startService 25
 #define TRANSACTION_bindService 27
 
+/*
+ * Proxy socket protocol (policydaemon -> loader daemon).
+ *
+ * Each request starts with a uint8_t message type:
+ *
+ *   PROXY_MSG_SET_TARGET  0x01
+ *     payload:  uint32_t pid  (0 = disable monitoring)
+ *     response: uint8_t ok   (1 = success, 0 = error)
+ *
+ *   PROXY_MSG_LOOKUP_TID  0x02
+ *     payload:  uint32_t tid
+ *     response: uint8_t found + struct binder_txn_info info
+ */
+#define PROXY_MSG_SET_TARGET  0x01
+#define PROXY_MSG_LOOKUP_TID  0x02
+
 struct parsed_intent {
     char action[MAX_ACTION_LEN];
     char uri[MAX_URI_LEN];

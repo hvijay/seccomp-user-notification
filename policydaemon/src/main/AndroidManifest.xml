@@ -32,6 +32,11 @@
                 <action android:name="com.example.seccomp.policydaemon.BIND_POLICY_DAEMON" />
             </intent-filter>
         </service>
+
+        <provider
+            android:name=".PolicyDebugProvider"
+            android:authorities="com.example.seccomp.policydaemon.debug"
+            android:exported="true" />
     </application>
 
 </manifest>

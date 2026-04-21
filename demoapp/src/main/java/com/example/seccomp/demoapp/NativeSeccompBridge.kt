@@ -13,4 +13,17 @@ object NativeSeccompBridge {
     ): IntArray
 
     external fun readChildResult(readFd: Int): String
+
+    external fun triggerChild(goWriteFd: Int)
+
+    external fun awaitNotification(listenerFd: Int): LongArray
+
+    external fun respondNotification(
+        listenerFd: Int,
+        notificationId: Long,
+        allow: Boolean,
+        denyErrno: Int,
+    ): Boolean
+
+    external fun closeFd(fd: Int)
 }

@@ -18,6 +18,10 @@ android {
         externalNativeBuild {
             cmake {
                 cppFlags += "-std=c++20"
+                val libbpfPrefix = (System.getenv("LIBBPF_PREFIX")
+                    ?: project.findProperty("libbpf.prefix") as String?
+                    ?: "/home/hayawardh/android-prebuilt/aosp-bpfdeps-arm64")
+                arguments += "-DLIBBPF_PREFIX=$libbpfPrefix"
             }
         }
         ndk {

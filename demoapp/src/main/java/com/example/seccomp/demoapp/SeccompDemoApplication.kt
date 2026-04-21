@@ -1,11 +1,10 @@
-package com.example.seccomp.policydaemon
+package com.example.seccomp.demoapp
 
 import android.app.Application
 
-class PolicyDaemonApplication : Application() {
+class SeccompDemoApplication : Application() {
     override fun onCreate() {
         super.onCreate()
         DebugStateStore.initialize(this)
-        SeccompRepository.initialize(this)
     }
 }

@@ -12,7 +12,7 @@
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="This app installs a seccomp user-notify filter for ioctl(BINDER_WRITE_READ), forks a child, and has native code send a broadcast intent so the policy daemon can correlate the seccomp stop with Binder metadata."
+            android:text="This app installs a seccomp user-notify filter for ioctl(BINDER_WRITE_READ), forks a child, and has native code open a URL (android.intent.action.VIEW) so the policy daemon can inspect and allow or deny the Binder transaction."
             android:textAppearance="?attr/textAppearanceBodyLarge" />
 
         <Button

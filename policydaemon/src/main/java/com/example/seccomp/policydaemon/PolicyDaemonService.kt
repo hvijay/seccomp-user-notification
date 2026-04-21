@@ -8,6 +8,7 @@ import android.app.Service
 import android.content.Intent
 import android.os.Build
 import android.os.IBinder
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.example.seccomp.shared.ISeccompPolicyDaemon
 import com.example.seccomp.shared.ServiceContract
@@ -19,6 +20,10 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 
 class PolicyDaemonService : Service() {
+    companion object {
+        private const val TAG = "PolicyDaemonService"
+    }
+
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
     private val binder = object : ISeccompPolicyDaemon.Stub() {
@@ -34,6 +39,26 @@ class PolicyDaemonService : Service() {
 
         override fun unregisterSession(sessionId: String) {
             SeccompRepository.unregisterSession(sessionId)
+        }
+
+        override fun publishPendingRequest(
+            sessionId: String,
+            notificationId: Long,
+            pid: Int,
+            syscallNr: Int,
+            ioctlCmd: Long,
+        ) {
+            SeccompRepository.publishPendingRequest(
+                sessionId = sessionId,
+                notificationId = notificationId,
+                pid = pid,
+                syscallNr = syscallNr,
+                ioctlCmd = ioctlCmd,
+            )
+        }
+
+        override fun getDecision(sessionId: String, notificationId: Long): Int {
+            return SeccompRepository.getDecision(sessionId, notificationId)
         }
     }
 
@@ -59,6 +84,7 @@ class PolicyDaemonService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        handleCommand(intent)
         return START_STICKY
     }
 
@@ -81,6 +107,29 @@ class PolicyDaemonService : Service() {
             .setContentIntent(contentIntent)
             .setOngoing(true)
             .build()
+    }
+
+    private fun handleCommand(intent: Intent?) {
+        if (intent?.action != ServiceContract.DAEMON_COMMAND_ACTION) {
+            return
+        }
+
+        val decision = intent.getStringExtra(ServiceContract.EXTRA_DECISION)
+        val notificationKey = intent.getStringExtra(ServiceContract.EXTRA_NOTIFICATION_KEY)
+        val allow = when (decision) {
+            ServiceContract.DECISION_ALLOW -> true
+            ServiceContract.DECISION_DENY -> false
+            else -> {
+                Log.w(TAG, "Ignoring unknown daemon decision: $decision")
+                return
+            }
+        }
+
+        val ok = SeccompRepository.respondToPendingRequest(allow, notificationKey)
+        Log.i(
+            TAG,
+            "ADB command decision=$decision key=${notificationKey ?: "<first>"} result=$ok",
+        )
     }
 
     private fun createNotificationChannel() {

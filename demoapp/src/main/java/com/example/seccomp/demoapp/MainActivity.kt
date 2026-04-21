@@ -4,9 +4,11 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
+import android.net.Uri
 import android.os.Bundle
 import android.os.IBinder
 import android.os.ParcelFileDescriptor
+import android.system.OsConstants
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
@@ -23,6 +25,7 @@ class MainActivity : AppCompatActivity() {
     private var bound = false
     private var lastResultMessage: String? = null
     private var demoInFlight = false
+    private var pendingIntentRun = false
 
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
@@ -32,6 +35,7 @@ class MainActivity : AppCompatActivity() {
                 updateStatus("Policy daemon connected.")
             }
             binding.startDemoButton.isEnabled = !demoInFlight
+            maybeRunPendingIntentDemo()
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
@@ -65,6 +69,14 @@ class MainActivity : AppCompatActivity() {
         binding.startDemoButton.setOnClickListener {
             runDemo()
         }
+
+        handleLaunchIntent(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleLaunchIntent(intent)
     }
 
     override fun onStart() {
@@ -95,6 +107,27 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun handleLaunchIntent(intent: Intent?) {
+        if (intent?.action != ServiceContract.DEMO_RUN_ACTION) {
+            return
+        }
+        pendingIntentRun = true
+        if (bound) {
+            maybeRunPendingIntentDemo()
+        } else {
+            updateStatus("RUN_DEMO intent received. Waiting for policy daemon bind.")
+            bindToDaemon()
+        }
+    }
+
+    private fun maybeRunPendingIntentDemo() {
+        if (!pendingIntentRun || demoInFlight || !bound) {
+            return
+        }
+        pendingIntentRun = false
+        runDemo()
+    }
+
     private fun runDemo() {
         val currentDaemon = daemon ?: run {
             updateStatus("Policy daemon not connected.")
@@ -104,15 +137,15 @@ class MainActivity : AppCompatActivity() {
         demoInFlight = true
         lastResultMessage = null
         binding.startDemoButton.isEnabled = false
-        updateStatus("Installing Binder ioctl filter, forking child, and issuing a native broadcast intent...")
+        updateStatus("Installing Binder ioctl filter, forking child, and issuing a native VIEW intent...")
 
         lifecycleScope.launch {
             val result = withContext(Dispatchers.IO) {
                 NativeSeccompBridge.installFilterForkAndTriggerIntent(
                     ServiceContract.DEMO_NATIVE_ACTION,
-                    ServiceContract.DEMO_PACKAGE,
                     "",
-                    "https://example.com/seccomp-poc",
+                    "",
+                    ServiceContract.DEMO_NATIVE_URI,
                 )
             }
 
@@ -126,6 +159,7 @@ class MainActivity : AppCompatActivity() {
             val listenerFd = result[0]
             val childPid = result[1]
             val resultFd = result.getOrNull(2) ?: -1
+            val goWriteFd = result.getOrNull(3) ?: -1
             if (listenerFd < 0) {
                 demoInFlight = false
                 binding.startDemoButton.isEnabled = true
@@ -134,12 +168,14 @@ class MainActivity : AppCompatActivity() {
             }
 
             val sessionId = "session-${System.currentTimeMillis()}"
+            val myPid = android.os.Process.myPid()
             val description =
-                "Intercept ioctl(BINDER_WRITE_READ) from forked child pid=$childPid while it sends a native broadcast Intent."
+                "Intercept ioctl(BINDER_WRITE_READ) from forked child pid=$childPid while it opens ${ServiceContract.DEMO_NATIVE_URI}."
 
+            val localListenerFd = ParcelFileDescriptor.adoptFd(listenerFd).detachFd()
             val registered = runCatching {
-                ParcelFileDescriptor.adoptFd(listenerFd).use { pfd ->
-                    currentDaemon.registerSession(sessionId, pfd, description, childPid)
+                ParcelFileDescriptor.fromFd(localListenerFd).use { pfd ->
+                    currentDaemon.registerSession(sessionId, pfd, description, myPid)
                 }
             }.getOrElse { error ->
                 updateStatus("Failed to send listener FD to daemon: ${error.message}")
@@ -148,33 +184,106 @@ class MainActivity : AppCompatActivity() {
 
             updateStatus(
                 if (registered) {
-                    "Listener handed to daemon. Review Binder ioctl request in policy daemon app for child pid=$childPid."
+                    "Listener is active locally. Review Binder ioctl request in policy daemon app for child pid=$childPid (cgroup from myPid=$myPid)."
                 } else {
                     "Daemon rejected the listener registration."
                 },
             )
 
+            /* registerSession is synchronous: by the time it returns, nativeStartListener
+               has already sent SET_TARGET to the loader and the BPF cgroup filter is armed.
+               Signal the child now so its ioctl(BINDER_WRITE_READ) is captured by eBPF. */
+            if (goWriteFd >= 0) {
+                NativeSeccompBridge.triggerChild(goWriteFd)
+            }
+
             if (registered && resultFd >= 0) {
-                lifecycleScope.launch {
+                lifecycleScope.launch waitForDecision@{
+                    val notification = withContext(Dispatchers.IO) {
+                        NativeSeccompBridge.awaitNotification(localListenerFd)
+                    }
+                    val recvStatus = notification.getOrNull(0) ?: -1L
+                    if (recvStatus != 0L) {
+                        demoInFlight = false
+                        updateStatus("Failed to receive seccomp notification. errno=${-recvStatus}")
+                        NativeSeccompBridge.closeFd(localListenerFd)
+                        binding.startDemoButton.isEnabled = bound
+                        return@waitForDecision
+                    }
+
+                    val notificationId = notification.getOrNull(1) ?: 0L
+                    val requestPid = notification.getOrNull(2)?.toInt() ?: -1
+                    val syscallNr = notification.getOrNull(3)?.toInt() ?: -1
+                    val ioctlCmd = notification.getOrNull(4) ?: 0L
+                    runCatching {
+                        currentDaemon.publishPendingRequest(
+                            sessionId,
+                            notificationId,
+                            requestPid,
+                            syscallNr,
+                            ioctlCmd,
+                        )
+                    }
+
+                    val decision = withContext<Int>(Dispatchers.IO) {
+                        var value = 0
+                        while (value == 0) {
+                            value = runCatching {
+                                currentDaemon.getDecision(sessionId, notificationId)
+                            }.getOrDefault(0)
+                            if (value == 0) {
+                                Thread.sleep(100)
+                            }
+                        }
+                        value
+                    }
+
+                    withContext(Dispatchers.IO) {
+                        NativeSeccompBridge.respondNotification(
+                            localListenerFd,
+                            notificationId,
+                            decision > 0,
+                            OsConstants.EPERM,
+                        )
+                        NativeSeccompBridge.closeFd(localListenerFd)
+                    }
+
                     val outcome = withContext(Dispatchers.IO) {
                         NativeSeccompBridge.readChildResult(resultFd)
                     }
                     demoInFlight = false
                     lastResultMessage = outcome
+                    if (decision > 0) {
+                        launchVisibleDemoIntent()
+                    }
                     updateStatus(outcome)
                     binding.startDemoButton.isEnabled = bound
                 }
             } else {
                 demoInFlight = false
+                NativeSeccompBridge.closeFd(localListenerFd)
             }
             if (!registered) {
+                /* Unblock and discard the child — nobody is listening. */
+                if (goWriteFd >= 0) NativeSeccompBridge.triggerChild(goWriteFd)
                 binding.startDemoButton.isEnabled = true
             }
         }
     }
 
     private fun updateStatus(message: String) {
+        DebugStateStore.updateStatus(message)
         binding.statusText.text = message
+    }
+
+    private fun launchVisibleDemoIntent() {
+        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(ServiceContract.DEMO_NATIVE_URI)).apply {
+            addCategory(Intent.CATEGORY_BROWSABLE)
+        }
+        runCatching { startActivity(intent) }
+            .onFailure { error ->
+                showToast("Allowed, but browser launch failed: ${error.message}")
+            }
     }
 
     private fun showToast(message: String) {

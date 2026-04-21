@@ -5,14 +5,10 @@ object SeccompNativeBridge {
         System.loadLibrary("seccomp_policy")
     }
 
-    external fun nativeStartListener(sessionId: String, fd: Int, targetPid: Int): Boolean
+    external fun nativeStartMonitoring(
+        sessionId: String,
+        targetPid: Int,
+    ): Boolean
 
     external fun nativeStopListener(sessionId: String)
-
-    external fun nativeRespond(
-        sessionId: String,
-        notificationId: Long,
-        allow: Boolean,
-        denyErrno: Int,
-    ): Boolean
 }

@@ -1,21 +1,14 @@
 #include <android/log.h>
 #include <jni.h>
 #include <errno.h>
-#include <fcntl.h>
-#include <linux/bpf.h>
-#include <linux/seccomp.h>
-#include <sys/ioctl.h>
-#include <sys/syscall.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 
-#include <atomic>
 #include <cstring>
-#include <fstream>
 #include <memory>
 #include <mutex>
-#include <sstream>
 #include <string>
-#include <thread>
 #include <unordered_map>
 
 #include "../../../../common/shared_types.h"
@@ -23,179 +16,106 @@
 namespace {
 
 constexpr const char* kTag = "SeccompPolicyJNI";
-constexpr const char* kPinnedTxnMapPath = "/sys/fs/bpf/binder_monitor/txn_map";
-
-JavaVM* g_vm = nullptr;
-jclass g_repo_class = nullptr;
-jmethodID g_on_notification = nullptr;
-
-struct TxnLookupResult {
-    binder_txn_info info{};
-    std::string status;
-    bool found = false;
-};
+constexpr const char* kProxySocketPath = "@binder_monitor_proxy";
 
 struct Session {
     std::string id;
-    int fd = -1;
     int target_pid = -1;
-    int txn_map_fd = -1;
-    std::string cgroup_path;
-    std::atomic_bool running = true;
-    std::thread thread;
+    int proxy_fd = -1;
 };
 
 std::mutex g_sessions_mutex;
 std::unordered_map<std::string, std::shared_ptr<Session>> g_sessions;
 
 void LogError(const char* message) {
-    __android_log_print(ANDROID_LOG_ERROR, kTag, "%s errno=%d", message, errno);
+    __android_log_print(ANDROID_LOG_ERROR, kTag, "%s errno=%d (%s)", message, errno, strerror(errno));
 }
 
-int SysBpf(enum bpf_cmd cmd, union bpf_attr* attr) {
-    return static_cast<int>(syscall(__NR_bpf, cmd, attr, sizeof(*attr)));
+static ssize_t ReadFull(int fd, void* buf, size_t n) {
+    size_t total = 0;
+    while (total < n) {
+        ssize_t r = read(fd, static_cast<char*>(buf) + total, n - total);
+        if (r <= 0) return r == 0 ? static_cast<ssize_t>(total) : r;
+        total += static_cast<size_t>(r);
+    }
+    return static_cast<ssize_t>(total);
 }
 
-std::string ReadCgroupPathForPid(pid_t pid) {
-    std::ifstream input("/proc/" + std::to_string(pid) + "/cgroup");
-    std::string line;
-    while (std::getline(input, line)) {
-        if (line.rfind("0::", 0) == 0) {
-            return "/sys/fs/cgroup" + line.substr(3);
-        }
+static ssize_t WriteFull(int fd, const void* buf, size_t n) {
+    size_t written = 0;
+    while (written < n) {
+        ssize_t r = write(fd, static_cast<const char*>(buf) + written, n - written);
+        if (r <= 0) return r == 0 ? static_cast<ssize_t>(written) : r;
+        written += static_cast<size_t>(r);
     }
-    return "";
+    return static_cast<ssize_t>(written);
 }
 
-int OpenPinnedTxnMap() {
-    union bpf_attr attr {};
-    attr.pathname = reinterpret_cast<__u64>(kPinnedTxnMapPath);
-    attr.file_flags = O_RDONLY;
-    return SysBpf(BPF_OBJ_GET, &attr);
-}
-
-TxnLookupResult LookupTransactionForTid(int map_fd, uint32_t tid) {
-    TxnLookupResult result;
-    if (map_fd < 0) {
-        result.status = "Pinned txn_map unavailable";
-        return result;
+static bool SendSetTarget(int proxy_fd, uint32_t pid) {
+    uint8_t msg = PROXY_MSG_SET_TARGET;
+    if (WriteFull(proxy_fd, &msg, 1) != 1 ||
+        WriteFull(proxy_fd, &pid, sizeof(pid)) != static_cast<ssize_t>(sizeof(pid))) {
+        LogError("SendSetTarget: write failed");
+        return false;
     }
-
-    union bpf_attr attr {};
-    attr.map_fd = static_cast<__u32>(map_fd);
-    attr.key = reinterpret_cast<__u64>(&tid);
-    attr.value = reinterpret_cast<__u64>(&result.info);
-    if (SysBpf(BPF_MAP_LOOKUP_AND_DELETE_ELEM, &attr) == 0) {
-        result.found = true;
-        result.status = "eBPF txn_map hit";
-        return result;
+    uint8_t ok = 0;
+    if (ReadFull(proxy_fd, &ok, 1) != 1) {
+        LogError("SendSetTarget: read response failed");
+        return false;
     }
-    if (errno == ENOENT) {
-        result.status = "No eBPF entry for tid";
-        return result;
+    if (!ok) {
+        __android_log_print(ANDROID_LOG_ERROR, kTag,
+            "SendSetTarget: loader returned error for pid=%u", pid);
+        return false;
     }
-
-    result.status = "txn_map lookup failed";
-    return result;
-}
-
-bool NotificationStillValid(const Session& session, uint64_t id) {
-#ifdef SECCOMP_IOCTL_NOTIF_ID_VALID
-    if (ioctl(session.fd, SECCOMP_IOCTL_NOTIF_ID_VALID, &id) == 0) {
-        return true;
-    }
-    return errno != ENOENT;
-#else
-    (void)session;
-    (void)id;
     return true;
-#endif
 }
 
-jstring NewJavaString(JNIEnv* env, const std::string& value) {
-    return env->NewStringUTF(value.c_str());
-}
+static int ConnectToProxySocket() {
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    socklen_t addr_len = sizeof(addr);
+    if (kProxySocketPath[0] == '@') {
+        size_t name_len = strnlen(kProxySocketPath + 1, sizeof(addr.sun_path) - 1);
+        memcpy(addr.sun_path + 1, kProxySocketPath + 1, name_len);
+        addr_len = static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + 1 + name_len);
+    } else {
+        strncpy(addr.sun_path, kProxySocketPath, sizeof(addr.sun_path) - 1);
+    }
 
-void DeliverNotification(const Session& session, const seccomp_notif& request,
-                         const TxnLookupResult& txn) {
-    JNIEnv* env = nullptr;
-    bool should_detach = false;
-    if (g_vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK) {
-        if (g_vm->AttachCurrentThread(&env, nullptr) != JNI_OK) {
-            return;
+    constexpr int kMaxAttempts = 40;
+    constexpr useconds_t kRetryDelayUs = 50 * 1000;
+    int last_errno = 0;
+    for (int attempt = 1; attempt <= kMaxAttempts; ++attempt) {
+        int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (fd < 0) {
+            LogError("ConnectToProxySocket: socket() failed");
+            return -1;
         }
-        should_detach = true;
-    }
 
-    jstring session_id = NewJavaString(env, session.id);
-    jstring cgroup_path = NewJavaString(env, session.cgroup_path);
-    jstring monitor_status = NewJavaString(env, txn.status);
-    jstring binder_interface = NewJavaString(env, txn.found ? txn.info.interface : "");
-    jstring intent_action = NewJavaString(env, txn.found ? txn.info.intent.action : "");
-    jstring intent_uri = NewJavaString(env, txn.found ? txn.info.intent.uri : "");
+        if (connect(fd, reinterpret_cast<sockaddr*>(&addr), addr_len) == 0) {
+            __android_log_print(ANDROID_LOG_INFO, kTag,
+                "ConnectToProxySocket: connected to %s after %d attempt(s)",
+                kProxySocketPath, attempt);
+            return fd;
+        }
 
-    env->CallStaticVoidMethod(
-            g_repo_class,
-            g_on_notification,
-            session_id,
-            static_cast<jlong>(request.id),
-            static_cast<jint>(request.pid),
-            static_cast<jint>(request.data.nr),
-            static_cast<jlong>(request.data.args[1]),
-            static_cast<jint>(session.target_pid),
-            cgroup_path,
-            monitor_status,
-            binder_interface,
-            static_cast<jint>(txn.found ? txn.info.code : 0),
-            static_cast<jint>(txn.found ? txn.info.target_handle : 0),
-            intent_action,
-            intent_uri,
-            static_cast<jboolean>(txn.found && txn.info.parcel_truncated != 0));
-
-    env->DeleteLocalRef(session_id);
-    env->DeleteLocalRef(cgroup_path);
-    env->DeleteLocalRef(monitor_status);
-    env->DeleteLocalRef(binder_interface);
-    env->DeleteLocalRef(intent_action);
-    env->DeleteLocalRef(intent_uri);
-
-    if (should_detach) {
-        g_vm->DetachCurrentThread();
-    }
-}
-
-void ListenerMain(std::shared_ptr<Session> session) {
-    while (session->running) {
-        seccomp_notif request{};
-        if (ioctl(session->fd, SECCOMP_IOCTL_NOTIF_RECV, &request) != 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            if (session->running) {
-                LogError("SECCOMP_IOCTL_NOTIF_RECV failed");
-            }
+        last_errno = errno;
+        close(fd);
+        if (last_errno != ECONNREFUSED && last_errno != ENOENT) {
             break;
         }
-
-        if (!NotificationStillValid(*session, request.id)) {
-            continue;
-        }
-
-        const TxnLookupResult txn = LookupTransactionForTid(session->txn_map_fd, request.pid);
-        DeliverNotification(*session, request, txn);
+        usleep(kRetryDelayUs);
     }
+
+    __android_log_print(ANDROID_LOG_ERROR, kTag,
+        "ConnectToProxySocket: connect(%s) failed after retries: errno=%d (%s)",
+        kProxySocketPath, last_errno, strerror(last_errno));
+    errno = last_errno;
+    return -1;
 }
 
-std::shared_ptr<Session> FindSession(const std::string& session_id) {
-    std::lock_guard<std::mutex> lock(g_sessions_mutex);
-    auto it = g_sessions.find(session_id);
-    if (it == g_sessions.end()) {
-        return nullptr;
-    }
-    return it->second;
-}
-
-std::string CopyJString(JNIEnv* env, jstring value) {
+static std::string CopyJString(JNIEnv* env, jstring value) {
     const char* raw = env->GetStringUTFChars(value, nullptr);
     std::string out = raw != nullptr ? raw : "";
     if (raw != nullptr) {
@@ -207,36 +127,31 @@ std::string CopyJString(JNIEnv* env, jstring value) {
 }  // namespace
 
 extern "C" JNIEXPORT jboolean JNICALL
-Java_com_example_seccomp_policydaemon_SeccompNativeBridge_nativeStartListener(
-        JNIEnv* env, jclass, jstring session_id_j, jint fd, jint target_pid) {
+Java_com_example_seccomp_policydaemon_SeccompNativeBridge_nativeStartMonitoring(
+        JNIEnv* env, jclass, jstring session_id_j, jint target_pid) {
     const std::string session_id = CopyJString(env, session_id_j);
-    if (session_id.empty() || fd < 0 || target_pid <= 0) {
-        if (fd >= 0) {
-            close(fd);
-        }
+    if (session_id.empty() || target_pid <= 0) {
         return JNI_FALSE;
     }
 
     auto session = std::make_shared<Session>();
     session->id = session_id;
-    session->fd = fd;
     session->target_pid = target_pid;
-    session->cgroup_path = ReadCgroupPathForPid(target_pid);
-    session->txn_map_fd = OpenPinnedTxnMap();
-
-    {
-        std::lock_guard<std::mutex> lock(g_sessions_mutex);
-        if (g_sessions.contains(session_id)) {
-            if (session->txn_map_fd >= 0) {
-                close(session->txn_map_fd);
-            }
-            close(fd);
-            return JNI_FALSE;
-        }
-        g_sessions.emplace(session_id, session);
+    session->proxy_fd = ConnectToProxySocket();
+    if (session->proxy_fd < 0) {
+        return JNI_FALSE;
+    }
+    if (!SendSetTarget(session->proxy_fd, static_cast<uint32_t>(target_pid))) {
+        close(session->proxy_fd);
+        return JNI_FALSE;
     }
 
-    session->thread = std::thread([session]() { ListenerMain(session); });
+    std::lock_guard<std::mutex> lock(g_sessions_mutex);
+    if (g_sessions.contains(session_id)) {
+        close(session->proxy_fd);
+        return JNI_FALSE;
+    }
+    g_sessions.emplace(session_id, session);
     return JNI_TRUE;
 }
 
@@ -256,69 +171,17 @@ Java_com_example_seccomp_policydaemon_SeccompNativeBridge_nativeStopListener(
         g_sessions.erase(it);
     }
 
-    session->running = false;
-    if (session->fd >= 0) {
-        close(session->fd);
-        session->fd = -1;
+    if (session->proxy_fd >= 0) {
+        SendSetTarget(session->proxy_fd, 0);
+        close(session->proxy_fd);
+        session->proxy_fd = -1;
     }
-    if (session->thread.joinable()) {
-        session->thread.join();
-    }
-    if (session->txn_map_fd >= 0) {
-        close(session->txn_map_fd);
-        session->txn_map_fd = -1;
-    }
-}
-
-extern "C" JNIEXPORT jboolean JNICALL
-Java_com_example_seccomp_policydaemon_SeccompNativeBridge_nativeRespond(
-        JNIEnv* env, jclass, jstring session_id_j, jlong notification_id, jboolean allow,
-        jint deny_errno) {
-    const std::string session_id = CopyJString(env, session_id_j);
-
-    auto session = FindSession(session_id);
-    if (session == nullptr || session->fd < 0) {
-        return JNI_FALSE;
-    }
-
-    seccomp_notif_resp response{};
-    response.id = static_cast<uint64_t>(notification_id);
-    response.val = allow ? 0 : -1;
-    response.error = allow ? 0 : -deny_errno;
-    response.flags = allow ? SECCOMP_USER_NOTIF_FLAG_CONTINUE : 0;
-
-    if (ioctl(session->fd, SECCOMP_IOCTL_NOTIF_SEND, &response) != 0) {
-        LogError("SECCOMP_IOCTL_NOTIF_SEND failed");
-        return JNI_FALSE;
-    }
-    return JNI_TRUE;
 }
 
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
-    g_vm = vm;
-
     JNIEnv* env = nullptr;
     if (vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK) {
         return JNI_ERR;
     }
-
-    jclass local_repo = env->FindClass("com/example/seccomp/policydaemon/SeccompRepository");
-    if (local_repo == nullptr) {
-        return JNI_ERR;
-    }
-    g_repo_class = reinterpret_cast<jclass>(env->NewGlobalRef(local_repo));
-    env->DeleteLocalRef(local_repo);
-    if (g_repo_class == nullptr) {
-        return JNI_ERR;
-    }
-
-    g_on_notification = env->GetStaticMethodID(
-            g_repo_class,
-            "onNativeNotification",
-            "(Ljava/lang/String;JIIJILjava/lang/String;Ljava/lang/String;Ljava/lang/String;IILjava/lang/String;Ljava/lang/String;Z)V");
-    if (g_on_notification == nullptr) {
-        return JNI_ERR;
-    }
-
     return JNI_VERSION_1_6;
 }

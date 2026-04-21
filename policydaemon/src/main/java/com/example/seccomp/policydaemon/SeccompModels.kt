@@ -23,3 +23,9 @@ data class RepositoryState(
     val pendingRequests: List<PendingRequest> = emptyList(),
     val lastStatus: String = "No active sessions.",
 )
+
+enum class DecisionState(val code: Int) {
+    PENDING(0),
+    ALLOW(1),
+    DENY(-1),
+}

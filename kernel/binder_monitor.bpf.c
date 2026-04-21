@@ -3,6 +3,26 @@
 #include "compat/bpf_helpers_min.h"
 
 #define MAX_UTF16_CHARS 64
+#define ARM64_NR_IOCTL 29
+
+/* ARM64 MTE tags live in bits 56-63. Strip before passing to bpf_probe_read_user. */
+static __always_inline binder_uintptr_t untag_ptr(binder_uintptr_t ptr)
+{
+    return ptr & 0x00FFFFFFFFFFFFFFULL;
+}
+
+struct trace_event_raw_sys_enter_min {
+    __u64 common;
+    long id;
+    unsigned long args[6];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u64);
+} target_cgroup_map SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -17,11 +37,6 @@ struct {
     __type(key, __u32);
     __type(value, struct binder_txn_info);
 } txn_map SEC(".maps");
-
-static __always_inline __u32 min_u32(__u32 a, __u32 b)
-{
-    return a < b ? a : b;
-}
 
 static __always_inline __u64 min_u64(__u64 a, __u64 b)
 {
@@ -39,7 +54,7 @@ static __always_inline int user_read_u32(binder_uintptr_t base, __u32 limit, __u
     if (offset + sizeof(*out) > limit) {
         return -1;
     }
-    return bpf_probe_read_user(out, sizeof(*out), (const void *)(base + offset));
+    return bpf_probe_read_user(out, sizeof(*out), (const void *)(untag_ptr(base) + offset));
 }
 
 static __always_inline __u32 read_string16_from_user(binder_uintptr_t base, __u32 limit,
@@ -75,7 +90,7 @@ static __always_inline __u32 read_string16_from_user(binder_uintptr_t base, __u3
         if (char_offset + sizeof(ch) > limit) {
             break;
         }
-        if (bpf_probe_read_user(&ch, sizeof(ch), (const void *)(base + char_offset)) != 0) {
+        if (bpf_probe_read_user(&ch, sizeof(ch), (const void *)(untag_ptr(base) + char_offset)) != 0) {
             break;
         }
 
@@ -160,7 +175,7 @@ static __always_inline void capture_binder_objects(struct binder_txn_info *info,
         }
 
         if (bpf_probe_read_user(&obj_offset, sizeof(obj_offset),
-                                (const void *)(txn->data.ptr.offsets +
+                                (const void *)(untag_ptr(txn->data.ptr.offsets) +
                                                (i * sizeof(binder_size_t)))) != 0) {
             break;
         }
@@ -170,7 +185,7 @@ static __always_inline void capture_binder_objects(struct binder_txn_info *info,
         }
 
         if (bpf_probe_read_user(&obj, sizeof(obj),
-                                (const void *)(txn->data.ptr.buffer + obj_offset)) != 0) {
+                                (const void *)(untag_ptr(txn->data.ptr.buffer) + obj_offset)) != 0) {
             continue;
         }
 
@@ -180,13 +195,14 @@ static __always_inline void capture_binder_objects(struct binder_txn_info *info,
     }
 }
 
-SEC("lsm_cgroup/file_ioctl")
-int binder_monitor(__u64 *ctx)
+SEC("tracepoint/raw_syscalls/sys_enter")
+int binder_monitor(struct trace_event_raw_sys_enter_min *ctx)
 {
-    unsigned int cmd = (unsigned int)ctx[1];
-    unsigned long arg = (unsigned long)ctx[2];
-    int ret = (int)ctx[3];
+    unsigned int cmd = 0;
+    unsigned long arg = 0;
     __u32 zero = 0;
+    __u64 current_cgroup_id = 0;
+    __u64 *target_cgroup_id = 0;
     __u64 pid_tgid;
     __u64 uid_gid;
     struct binder_write_read bwr = {};
@@ -195,17 +211,34 @@ int binder_monitor(__u64 *ctx)
     __u32 bcmd = 0;
     __u32 capture_size = 0;
 
-    if (ret == 0) {
+    if (ctx->id != ARM64_NR_IOCTL) {
         return 0;
     }
 
+    target_cgroup_id = bpf_map_lookup_elem(&target_cgroup_map, &zero);
+    if (!target_cgroup_id || *target_cgroup_id == 0) {
+        return 0;
+    }
+
+    current_cgroup_id = bpf_get_current_cgroup_id();
+    bpf_printk("binder_monitor: ioctl cgroup cur=%llu target=%llu",
+               current_cgroup_id, *target_cgroup_id);
+    if (current_cgroup_id != *target_cgroup_id) {
+        return 0;
+    }
+
+    cmd = (unsigned int)ctx->args[1];
+    arg = (unsigned long)ctx->args[2];
+
+    bpf_printk("binder_monitor: cgroup match! cmd=0x%x BINDER_WRITE_READ=0x%x",
+               cmd, (__u32)BINDER_WRITE_READ);
     if (cmd != (__u32)BINDER_WRITE_READ) {
-        return 1;
+        return 0;
     }
 
     info = bpf_map_lookup_elem(&scratch, &zero);
     if (!info) {
-        return 1;
+        return 0;
     }
     info->pid = 0;
     info->tid = 0;
@@ -232,28 +265,28 @@ int binder_monitor(__u64 *ctx)
     info->parcel_captured = 0;
 
     if (bpf_probe_read_user(&bwr, sizeof(bwr), (const void *)arg) != 0) {
-        return 1;
+        return 0;
     }
 
     if (bwr.write_size < sizeof(bcmd) || bwr.write_buffer == 0) {
-        return 1;
+        return 0;
     }
 
-    if (bpf_probe_read_user(&bcmd, sizeof(bcmd), (const void *)bwr.write_buffer) != 0) {
-        return 1;
+    if (bpf_probe_read_user(&bcmd, sizeof(bcmd), (const void *)untag_ptr(bwr.write_buffer)) != 0) {
+        return 0;
     }
 
     if (bcmd != (__u32)BC_TRANSACTION && bcmd != (__u32)BC_REPLY) {
-        return 1;
+        return 0;
     }
 
     if (bwr.write_size < sizeof(bcmd) + sizeof(txn)) {
-        return 1;
+        return 0;
     }
 
     if (bpf_probe_read_user(&txn, sizeof(txn),
-                            (const void *)(bwr.write_buffer + sizeof(bcmd))) != 0) {
-        return 1;
+                            (const void *)(untag_ptr(bwr.write_buffer) + sizeof(bcmd))) != 0) {
+        return 0;
     }
 
     pid_tgid = bpf_get_current_pid_tgid();
@@ -275,16 +308,20 @@ int binder_monitor(__u64 *ctx)
     info->parcel_captured = capture_size;
 
     if (capture_size > 0 && txn.data.ptr.buffer != 0) {
+        binder_uintptr_t buf_addr = untag_ptr(txn.data.ptr.buffer);
         if (bpf_probe_read_user(info->raw_parcel, capture_size,
-                                (const void *)txn.data.ptr.buffer) == 0) {
-            parse_parcel_header(info, txn.data.ptr.buffer);
-            parse_known_intent_fields(info, txn.data.ptr.buffer);
+                                (const void *)buf_addr) == 0) {
+            parse_parcel_header(info, buf_addr);
+            parse_known_intent_fields(info, buf_addr);
         } else {
             info->parcel_captured = 0;
         }
     }
 
+    txn.data.ptr.buffer = untag_ptr(txn.data.ptr.buffer);
+    txn.data.ptr.offsets = untag_ptr(txn.data.ptr.offsets);
     capture_binder_objects(info, &txn);
     bpf_map_update_elem(&txn_map, &info->tid, info, BPF_ANY);
-    return 1;
+    bpf_printk("binder_monitor: recorded txn tid=%u bcmd=0x%x", info->tid, bcmd);
+    return 0;
 }

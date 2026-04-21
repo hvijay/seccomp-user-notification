@@ -11,7 +11,10 @@ This project sets up an end-to-end Android demo with two apps:
 - `demoapp`: trigger app
 - `policydaemon`: policy daemon app
 - `common/shared_types.h`: contract shared by the daemon-side native code and the design-aligned eBPF monitor
-- `kernel/binder_monitor.bpf.c`: scaffold for the per-cgroup Binder monitor described in `binder_monitor_design.md`
+- `kernel/binder_monitor.bpf.c`: global `lsm/file_ioctl` Binder monitor with in-program target-cgroup filtering
+- `loader/`: native Android loader that loads the BPF object, programs the target cgroup id map, pins `txn_map`, and attaches the monitor
+- `scripts/build_bpf.sh`: host-side BPF object build helper
+- `scripts/build_loader.sh`: Android loader build helper
 
 ## Flow
 
@@ -49,6 +52,22 @@ APK outputs:
 - `policydaemon/build/outputs/apk/debug/policydaemon-debug.apk`
 - `demoapp/build/outputs/apk/debug/demoapp-debug.apk`
 
+Build the Binder monitor object:
+
+```bash
+scripts/build_bpf.sh
+```
+
+Build the Android loader binary:
+
+```bash
+scripts/build_loader.sh
+```
+
+Expected loader output:
+
+- `loader/out/android-arm64/binder_monitor_loader`
+
 ## Install
 
 Install directly with `adb install -r`:
@@ -75,10 +94,26 @@ adb shell pm install -r /data/local/tmp/demoapp-debug.apk
 4. Tap `Install filter + fork native Binder child`.
 5. In `policydaemon`, choose `Allow` or `Deny` for the pending Binder `ioctl()` request.
 
+To enable Binder transaction correlation, deploy the monitor and loader, then attach the monitor to the target app's cgroup:
+
+```bash
+adb push kernel/binder_monitor.bpf.o /data/local/tmp/binder_monitor.bpf.o
+adb push loader/out/android-arm64/binder_monitor_loader /data/local/tmp/binder_monitor_loader
+adb shell chmod 755 /data/local/tmp/binder_monitor_loader
+adb shell su root /data/local/tmp/binder_monitor_loader load --pid <target-pid>
+```
+
+To remove the pinned attachment later:
+
+```bash
+adb shell su root /data/local/tmp/binder_monitor_loader unload --pid <target-pid>
+```
+
 ## Behavior notes
 
 - The demo filter only traps `ioctl(BINDER_WRITE_READ)`.
 - Allow uses `SECCOMP_USER_NOTIF_FLAG_CONTINUE`.
 - Deny returns `EPERM`.
 - The helper installs the filter on a short-lived native thread so the app's main/UI threads are not left permanently filtered.
+- The loader attaches the monitor as a global LSM hook and scopes it in-program using the target process's cgroup id.
 - If the pinned eBPF map is not available, the daemon still shows the seccomp stop, child TID, and target cgroup path, but Binder parcel metadata will be absent.
