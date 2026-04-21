@@ -8,7 +8,6 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.IBinder
 import android.os.ParcelFileDescriptor
-import android.system.OsConstants
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
@@ -184,7 +183,7 @@ class MainActivity : AppCompatActivity() {
 
             updateStatus(
                 if (registered) {
-                    "Listener is active locally. Review Binder ioctl request in policy daemon app for child pid=$childPid (cgroup from myPid=$myPid)."
+                    "Listener transferred to loader daemon. Review Binder ioctl request in policy daemon app for child pid=$childPid (cgroup from myPid=$myPid)."
                 } else {
                     "Daemon rejected the listener registration."
                 },
@@ -198,62 +197,15 @@ class MainActivity : AppCompatActivity() {
             }
 
             if (registered && resultFd >= 0) {
-                lifecycleScope.launch waitForDecision@{
-                    val notification = withContext(Dispatchers.IO) {
-                        NativeSeccompBridge.awaitNotification(localListenerFd)
-                    }
-                    val recvStatus = notification.getOrNull(0) ?: -1L
-                    if (recvStatus != 0L) {
-                        demoInFlight = false
-                        updateStatus("Failed to receive seccomp notification. errno=${-recvStatus}")
-                        NativeSeccompBridge.closeFd(localListenerFd)
-                        binding.startDemoButton.isEnabled = bound
-                        return@waitForDecision
-                    }
-
-                    val notificationId = notification.getOrNull(1) ?: 0L
-                    val requestPid = notification.getOrNull(2)?.toInt() ?: -1
-                    val syscallNr = notification.getOrNull(3)?.toInt() ?: -1
-                    val ioctlCmd = notification.getOrNull(4) ?: 0L
-                    runCatching {
-                        currentDaemon.publishPendingRequest(
-                            sessionId,
-                            notificationId,
-                            requestPid,
-                            syscallNr,
-                            ioctlCmd,
-                        )
-                    }
-
-                    val decision = withContext<Int>(Dispatchers.IO) {
-                        var value = 0
-                        while (value == 0) {
-                            value = runCatching {
-                                currentDaemon.getDecision(sessionId, notificationId)
-                            }.getOrDefault(0)
-                            if (value == 0) {
-                                Thread.sleep(100)
-                            }
-                        }
-                        value
-                    }
-
-                    withContext(Dispatchers.IO) {
-                        NativeSeccompBridge.respondNotification(
-                            localListenerFd,
-                            notificationId,
-                            decision > 0,
-                            OsConstants.EPERM,
-                        )
-                        NativeSeccompBridge.closeFd(localListenerFd)
-                    }
-
+                NativeSeccompBridge.closeFd(localListenerFd)
+                lifecycleScope.launch {
                     val outcome = withContext(Dispatchers.IO) {
                         NativeSeccompBridge.readChildResult(resultFd)
                     }
+                    runCatching { currentDaemon.unregisterSession(sessionId) }
                     demoInFlight = false
                     lastResultMessage = outcome
-                    if (decision > 0) {
+                    if (outcome.contains("seccomp allowed")) {
                         launchVisibleDemoIntent()
                     }
                     updateStatus(outcome)

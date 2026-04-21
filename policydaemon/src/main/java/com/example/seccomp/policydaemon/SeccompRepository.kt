@@ -30,8 +30,8 @@ object SeccompRepository {
             return false
         }
         clearSessionsLocked()
+        val ok = SeccompNativeBridge.nativeRegisterSession(sessionId, targetPid, fd)
         runCatching { ParcelFileDescriptor.adoptFd(fd).close() }
-        val ok = SeccompNativeBridge.nativeStartMonitoring(sessionId, targetPid)
         if (!ok) {
             return false
         }
@@ -52,39 +52,16 @@ object SeccompRepository {
     }
 
     @Synchronized
-    fun publishPendingRequest(
-        sessionId: String,
-        notificationId: Long,
-        pid: Int,
-        syscallNr: Int,
-        ioctlCmd: Long,
-    ) {
-        val description = sessionDescriptions[sessionId] ?: "Unknown session"
-        val key = "$sessionId:$notificationId"
-        val targetPid = sessionTargetPids[sessionId] ?: -1
-        pendingRequests[key] = PendingRequest(
-            sessionId = sessionId,
-            notificationId = notificationId,
-            pid = pid,
-            syscallNr = syscallNr,
-            description = description,
-            ioctlCmd = ioctlCmd,
-            targetPid = targetPid,
-            cgroupPath = "",
-            monitorStatus = "seccomp user-notify",
-            binderInterface = "",
-            binderCode = 0,
-            targetHandle = 0,
-            intentAction = "",
-            intentUri = "",
-            parcelTruncated = false,
-        )
-        publish("Pending Binder request from tid=$pid (target pid=$targetPid). Tap allow or deny.")
-    }
-
-    @Synchronized
     fun allow(request: PendingRequest): Boolean {
-        decisions["${request.sessionId}:${request.notificationId}"] = DecisionState.ALLOW
+        val ok = SeccompNativeBridge.nativeRespondToPendingRequest(
+            request.sessionId,
+            request.notificationId,
+            true,
+        )
+        if (!ok) {
+            publish("Failed to allow notification ${request.notificationId} for pid=${request.pid}")
+            return false
+        }
         pendingRequests.remove("${request.sessionId}:${request.notificationId}")
         publish("Allowed notification ${request.notificationId} for pid=${request.pid}")
         return true
@@ -92,7 +69,15 @@ object SeccompRepository {
 
     @Synchronized
     fun deny(request: PendingRequest): Boolean {
-        decisions["${request.sessionId}:${request.notificationId}"] = DecisionState.DENY
+        val ok = SeccompNativeBridge.nativeRespondToPendingRequest(
+            request.sessionId,
+            request.notificationId,
+            false,
+        )
+        if (!ok) {
+            publish("Failed to deny notification ${request.notificationId} for pid=${request.pid}")
+            return false
+        }
         pendingRequests.remove("${request.sessionId}:${request.notificationId}")
         publish("Denied notification ${request.notificationId} for pid=${request.pid}")
         return true
@@ -114,18 +99,54 @@ object SeccompRepository {
         }
     }
 
-    @Synchronized
-    fun getDecision(sessionId: String, notificationId: Long): Int {
-        val key = "$sessionId:$notificationId"
-        return (decisions.remove(key) ?: DecisionState.PENDING).code
-    }
-
     private fun clearSessionsLocked() {
         sessionDescriptions.keys.toList().forEach { SeccompNativeBridge.nativeStopListener(it) }
         sessionDescriptions.clear()
         sessionTargetPids.clear()
         pendingRequests.clear()
         decisions.clear()
+    }
+
+    @Synchronized
+    fun refreshPendingRequests() {
+        val refreshed = linkedMapOf<String, PendingRequest>()
+        sessionDescriptions.forEach { (sessionId, description) ->
+            val targetPid = sessionTargetPids[sessionId] ?: -1
+            val parsed = SeccompNativeBridge.nativeGetPendingRequest(sessionId) ?: return@forEach
+            val notificationId = parsed.getOrNull(0)?.toLongOrNull() ?: return@forEach
+            val pid = parsed.getOrNull(1)?.toIntOrNull() ?: return@forEach
+            val syscallNr = parsed.getOrNull(2)?.toIntOrNull() ?: return@forEach
+            val ioctlCmd = parsed.getOrNull(3)?.toLongOrNull() ?: return@forEach
+            val key = "$sessionId:$notificationId"
+            refreshed[key] = PendingRequest(
+                sessionId = sessionId,
+                notificationId = notificationId,
+                pid = pid,
+                syscallNr = syscallNr,
+                description = description,
+                ioctlCmd = ioctlCmd,
+                targetPid = targetPid,
+                cgroupPath = "",
+                monitorStatus = "seccomp user-notify",
+                binderInterface = parsed.getOrNull(4).orEmpty(),
+                binderCode = parsed.getOrNull(5)?.toIntOrNull() ?: 0,
+                targetHandle = parsed.getOrNull(6)?.toIntOrNull() ?: 0,
+                intentAction = parsed.getOrNull(7).orEmpty(),
+                intentUri = parsed.getOrNull(8).orEmpty(),
+                parcelTruncated = parsed.getOrNull(9)?.toBooleanStrictOrNull() ?: false,
+            )
+        }
+        if (refreshed != pendingRequests) {
+            pendingRequests.clear()
+            pendingRequests.putAll(refreshed)
+            val status = if (pendingRequests.isEmpty()) {
+                "Listening for Binder seccomp notifications. Active sessions=${sessionDescriptions.size}"
+            } else {
+                val first = pendingRequests.values.first()
+                "Pending Binder request from tid=${first.pid} (target pid=${first.targetPid}). Tap allow or deny."
+            }
+            publish(status)
+        }
     }
 
     @Synchronized

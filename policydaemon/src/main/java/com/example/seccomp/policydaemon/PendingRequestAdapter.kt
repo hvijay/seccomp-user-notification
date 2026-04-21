@@ -1,5 +1,11 @@
 package com.example.seccomp.policydaemon
 
+import android.graphics.Color
+import android.graphics.Typeface
+import android.text.SpannableStringBuilder
+import android.text.Spanned
+import android.text.style.ForegroundColorSpan
+import android.text.style.StyleSpan
 import android.view.LayoutInflater
 import android.view.ViewGroup
 import androidx.recyclerview.widget.DiffUtil
@@ -37,35 +43,69 @@ class PendingRequestAdapter(
                     append(", code=${item.binderCode}")
                 }
             }
-            val body = buildString {
+            val body = SpannableStringBuilder().apply {
                 appendLine(item.description)
-                appendLine("notificationId=${item.notificationId}")
-                appendLine("session=${item.sessionId}")
-                appendLine("ioctlCmd=0x${item.ioctlCmd.toString(16)}")
-                appendLine("monitor=${item.monitorStatus}")
+                if (item.intentAction.isNotEmpty() || item.intentUri.isNotEmpty()) {
+                    appendHighlightedLine(
+                        "Intent",
+                        buildString {
+                            if (item.intentAction.isNotEmpty()) {
+                                append(item.intentAction)
+                            }
+                            if (item.intentUri.isNotEmpty()) {
+                                if (isNotEmpty()) append(" -> ")
+                                append(item.intentUri)
+                            }
+                        },
+                    )
+                    if (item.intentAction == "android.intent.action.VIEW") {
+                        appendHighlightedLine("Meaning", "This would open a link in a browser/app")
+                    }
+                }
+                appendNormalLine("notificationId", item.notificationId.toString())
+                appendNormalLine("session", item.sessionId)
+                appendNormalLine("ioctlCmd", "0x${item.ioctlCmd.toString(16)}")
+                appendNormalLine("monitor", item.monitorStatus)
                 if (item.cgroupPath.isNotEmpty()) {
-                    appendLine("cgroup=${item.cgroupPath}")
+                    appendNormalLine("cgroup", item.cgroupPath)
                 }
                 if (item.binderInterface.isNotEmpty()) {
-                    appendLine("interface=${item.binderInterface}")
+                    appendNormalLine("interface", item.binderInterface)
                 }
                 if (item.targetHandle != 0) {
-                    appendLine("targetHandle=${item.targetHandle}")
-                }
-                if (item.intentAction.isNotEmpty()) {
-                    appendLine("intentAction=${item.intentAction}")
-                }
-                if (item.intentUri.isNotEmpty()) {
-                    appendLine("intentUri=${item.intentUri}")
+                    appendNormalLine("targetHandle", item.targetHandle.toString())
                 }
                 if (item.parcelTruncated) {
-                    append("parcelTruncated=true")
+                    appendNormalLine("parcelTruncated", "true")
                 }
-            }.trim()
+                while (endsWith("\n")) {
+                    delete(length - 1, length)
+                }
+            }
             binding.titleText.text = header
             binding.bodyText.text = body
             binding.allowButton.setOnClickListener { onAllow(item) }
             binding.denyButton.setOnClickListener { onDeny(item) }
+        }
+
+        private fun SpannableStringBuilder.appendNormalLine(label: String, value: String) {
+            append(label)
+            append("=")
+            append(value)
+            append("\n")
+        }
+
+        private fun SpannableStringBuilder.appendHighlightedLine(label: String, value: String) {
+            val line = "$label: $value\n"
+            val start = length
+            append(line)
+            setSpan(StyleSpan(Typeface.BOLD), start, start + line.length - 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            setSpan(
+                ForegroundColorSpan(Color.parseColor("#FF5252")),
+                start,
+                start + line.length - 1,
+                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+            )
         }
     }
 

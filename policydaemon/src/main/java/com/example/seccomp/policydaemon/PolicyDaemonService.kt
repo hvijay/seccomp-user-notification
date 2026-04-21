@@ -40,26 +40,6 @@ class PolicyDaemonService : Service() {
         override fun unregisterSession(sessionId: String) {
             SeccompRepository.unregisterSession(sessionId)
         }
-
-        override fun publishPendingRequest(
-            sessionId: String,
-            notificationId: Long,
-            pid: Int,
-            syscallNr: Int,
-            ioctlCmd: Long,
-        ) {
-            SeccompRepository.publishPendingRequest(
-                sessionId = sessionId,
-                notificationId = notificationId,
-                pid = pid,
-                syscallNr = syscallNr,
-                ioctlCmd = ioctlCmd,
-            )
-        }
-
-        override fun getDecision(sessionId: String, notificationId: Long): Int {
-            return SeccompRepository.getDecision(sessionId, notificationId)
-        }
     }
 
     override fun onCreate() {
@@ -75,6 +55,12 @@ class PolicyDaemonService : Service() {
                 }
                 getSystemService(NotificationManager::class.java)
                     .notify(1001, buildNotification(summary))
+            }
+        }
+        scope.launch(Dispatchers.IO) {
+            while (true) {
+                SeccompRepository.refreshPendingRequests()
+                kotlinx.coroutines.delay(100)
             }
         }
     }

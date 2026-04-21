@@ -3,22 +3,33 @@
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
     android:layout_marginBottom="12dp"
-    android:background="@android:drawable/dialog_holo_light_frame"
+    android:background="#000000"
+    android:foregroundTint="#3CFF6B"
+    android:outlineAmbientShadowColor="#3CFF6B"
+    android:outlineSpotShadowColor="#3CFF6B"
+    android:padding="2dp"
     android:orientation="vertical"
-    android:padding="16dp">
+    android:paddingStart="16dp"
+    android:paddingTop="16dp"
+    android:paddingEnd="16dp"
+    android:paddingBottom="16dp">
 
     <TextView
         android:id="@+id/titleText"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:textAppearance="?attr/textAppearanceTitleMedium" />
+        android:textAppearance="?attr/textAppearanceTitleMedium"
+        android:textColor="#3CFF6B"
+        android:textStyle="bold" />
 
     <TextView
         android:id="@+id/bodyText"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginTop="8dp"
-        android:textAppearance="?attr/textAppearanceBodyMedium" />
+        android:textAppearance="?attr/textAppearanceBodyMedium"
+        android:textColor="#3CFF6B"
+        android:textIsSelectable="true" />
 
     <LinearLayout
         android:layout_width="match_parent"
@@ -31,13 +42,19 @@
             android:id="@+id/denyButton"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="Deny" />
+            android:backgroundTint="#2A0000"
+            android:text="Deny"
+            android:textColor="#FF5252"
+            android:textStyle="bold" />
 
         <Button
             android:id="@+id/allowButton"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_marginStart="12dp"
-            android:text="Allow" />
+            android:backgroundTint="#002A00"
+            android:text="Allow"
+            android:textColor="#3CFF6B"
+            android:textStyle="bold" />
     </LinearLayout>
 </LinearLayout>

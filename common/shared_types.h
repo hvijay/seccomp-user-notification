@@ -28,9 +28,29 @@
  *   PROXY_MSG_LOOKUP_TID  0x02
  *     payload:  uint32_t tid
  *     response: uint8_t found + struct binder_txn_info info
+ *
+ *   PROXY_MSG_REGISTER_LISTENER  0x03
+ *     payload:  ancillary fd (seccomp listener)
+ *     response: uint8_t ok
+ *
+ *   PROXY_MSG_GET_PENDING  0x04
+ *     payload:  none
+ *     response: uint8_t found + struct proxy_pending_request request
+ *
+ *   PROXY_MSG_SEND_DECISION  0x05
+ *     payload:  uint64_t notification_id + int32_t allow
+ *     response: uint8_t ok
+ *
+ *   PROXY_MSG_UNREGISTER  0x06
+ *     payload:  none
+ *     response: uint8_t ok
  */
 #define PROXY_MSG_SET_TARGET  0x01
 #define PROXY_MSG_LOOKUP_TID  0x02
+#define PROXY_MSG_REGISTER_LISTENER  0x03
+#define PROXY_MSG_GET_PENDING  0x04
+#define PROXY_MSG_SEND_DECISION  0x05
+#define PROXY_MSG_UNREGISTER  0x06
 
 struct parsed_intent {
     char action[MAX_ACTION_LEN];
@@ -73,6 +93,14 @@ struct binder_txn_info {
     struct binder_object_ref objects[MAX_BINDER_OBJECTS];
 
     __u8 raw_parcel[PARCEL_CAPTURE_SIZE];
+};
+
+struct proxy_pending_request {
+    __u64 notification_id;
+    __u32 pid;
+    __u32 syscall_nr;
+    __u64 ioctl_cmd;
+    struct binder_txn_info txn;
 };
 
 #endif  // SECCOMP_BINDER_MONITOR_SHARED_TYPES_H_

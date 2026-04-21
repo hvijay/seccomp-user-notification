@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <linux/bpf.h>
+#include <linux/seccomp.h>
 #include <linux/types.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -13,6 +14,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/ioctl.h>
 #include <sys/un.h>
 #include <stdint.h>
 #include <pthread.h>
@@ -290,8 +292,277 @@ static ssize_t read_full(int fd, void* buf, size_t n)
     return (ssize_t)total;
 }
 
-static void handle_proxy_client(int client_fd, int txn_map_fd, int target_map_fd)
+struct active_session {
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    int listener_fd;
+    int txn_map_fd;
+    bool worker_running;
+    bool stop_worker;
+    bool has_pending;
+    bool decision_ready;
+    bool allow;
+    struct seccomp_notif current_notif;
+    struct proxy_pending_request pending;
+    pthread_t worker_thread;
+};
+
+struct proxy_client_args {
+    int client_fd;
+    int txn_map_fd;
+    int target_map_fd;
+    uint32_t target_pid;
+    struct active_session session;
+};
+
+static int recv_fd_with_status(int sock_fd, int* out_fd)
 {
+    struct msghdr msg;
+    struct iovec iov;
+    int status = -EIO;
+    char control[CMSG_SPACE(sizeof(int))];
+
+    memset(&msg, 0, sizeof(msg));
+    memset(control, 0, sizeof(control));
+    iov.iov_base = &status;
+    iov.iov_len = sizeof(status);
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control;
+    msg.msg_controllen = sizeof(control);
+
+    if (recvmsg(sock_fd, &msg, 0) != (ssize_t)sizeof(status)) {
+        return -1;
+    }
+
+    *out_fd = -1;
+    for (struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
+         cmsg != NULL;
+         cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+        if (cmsg->cmsg_level == SOL_SOCKET &&
+            cmsg->cmsg_type == SCM_RIGHTS &&
+            cmsg->cmsg_len >= CMSG_LEN(sizeof(int))) {
+            memcpy(out_fd, CMSG_DATA(cmsg), sizeof(int));
+            break;
+        }
+    }
+    return status;
+}
+
+static void fill_pending_request(struct proxy_pending_request* pending,
+                                 const struct seccomp_notif* notif,
+                                 int txn_map_fd)
+{
+    memset(pending, 0, sizeof(*pending));
+    pending->notification_id = notif->id;
+    pending->pid = notif->pid;
+    pending->syscall_nr = notif->data.nr;
+    pending->ioctl_cmd = notif->data.args[1];
+
+    if (txn_map_fd >= 0 &&
+        sys_bpf_map_lookup_and_delete_elem(txn_map_fd, &pending->pid, &pending->txn) != 0 &&
+        errno != ENOENT) {
+        fprintf(stderr, "proxy: lookup tid=%u failed: %s\n",
+                pending->pid, strerror(errno));
+    }
+}
+
+static void* active_session_thread(void* opaque)
+{
+    struct active_session* session = (struct active_session*)opaque;
+    fprintf(stdout, "proxy: worker started listener_fd=%d txn_map_fd=%d\n",
+            session->listener_fd, session->txn_map_fd);
+    fflush(stdout);
+    for (;;) {
+        pthread_mutex_lock(&session->mutex);
+        if (session->stop_worker) {
+            pthread_mutex_unlock(&session->mutex);
+            break;
+        }
+        pthread_mutex_unlock(&session->mutex);
+
+        struct seccomp_notif notif;
+        memset(&notif, 0, sizeof(notif));
+        fprintf(stdout, "proxy: waiting for seccomp notification fd=%d\n", session->listener_fd);
+        fflush(stdout);
+        if (ioctl(session->listener_fd, SECCOMP_IOCTL_NOTIF_RECV, &notif) != 0) {
+            if (!session->stop_worker) {
+                fprintf(stderr, "proxy: SECCOMP_IOCTL_NOTIF_RECV failed: %s\n", strerror(errno));
+            }
+            break;
+        }
+        fprintf(stdout,
+                "proxy: received seccomp notification id=%llu pid=%u nr=%d arg1=%llu\n",
+                (unsigned long long)notif.id,
+                notif.pid,
+                notif.data.nr,
+                (unsigned long long)notif.data.args[1]);
+        fflush(stdout);
+
+        pthread_mutex_lock(&session->mutex);
+        if (session->stop_worker) {
+            pthread_mutex_unlock(&session->mutex);
+            break;
+        }
+
+        memset(&session->current_notif, 0, sizeof(session->current_notif));
+        session->current_notif = notif;
+        fill_pending_request(&session->pending, &notif, session->txn_map_fd);
+        fprintf(stdout,
+                "proxy: pending notification id=%llu tid=%u iface='%s' action='%s' uri='%s'\n",
+                (unsigned long long)session->pending.notification_id,
+                session->pending.pid,
+                session->pending.txn.interface,
+                session->pending.txn.intent.action,
+                session->pending.txn.intent.uri);
+        fflush(stdout);
+        session->has_pending = true;
+        session->decision_ready = false;
+        pthread_cond_broadcast(&session->cond);
+
+        while (!session->decision_ready && !session->stop_worker) {
+            pthread_cond_wait(&session->cond, &session->mutex);
+        }
+
+        bool allow = true;
+        if (session->decision_ready) {
+            allow = session->allow;
+        }
+        session->has_pending = false;
+        session->decision_ready = false;
+        pthread_cond_broadcast(&session->cond);
+        pthread_mutex_unlock(&session->mutex);
+
+        struct seccomp_notif_resp response;
+        memset(&response, 0, sizeof(response));
+        response.id = notif.id;
+        response.val = allow ? 0 : -1;
+        response.error = allow ? 0 : -EPERM;
+        response.flags = allow ? SECCOMP_USER_NOTIF_FLAG_CONTINUE : 0;
+        fprintf(stdout,
+                "proxy: sending seccomp response id=%llu allow=%d\n",
+                (unsigned long long)notif.id,
+                allow ? 1 : 0);
+        fflush(stdout);
+        if (ioctl(session->listener_fd, SECCOMP_IOCTL_NOTIF_SEND, &response) != 0) {
+            fprintf(stderr, "proxy: SECCOMP_IOCTL_NOTIF_SEND failed id=%llu: %s\n",
+                    (unsigned long long)notif.id, strerror(errno));
+        }
+
+        pthread_mutex_lock(&session->mutex);
+        if (session->stop_worker) {
+            pthread_mutex_unlock(&session->mutex);
+            break;
+        }
+        pthread_mutex_unlock(&session->mutex);
+    }
+
+    pthread_mutex_lock(&session->mutex);
+    session->worker_running = false;
+    session->has_pending = false;
+    session->decision_ready = false;
+    if (session->listener_fd >= 0) {
+        close(session->listener_fd);
+        session->listener_fd = -1;
+    }
+    pthread_cond_broadcast(&session->cond);
+    pthread_mutex_unlock(&session->mutex);
+    fprintf(stdout, "proxy: worker exiting\n");
+    fflush(stdout);
+    return NULL;
+}
+
+static void stop_active_session(struct active_session* session)
+{
+    pthread_mutex_lock(&session->mutex);
+    int listener_fd = session->listener_fd;
+    bool worker_running = session->worker_running;
+    bool has_pending = session->has_pending;
+    session->stop_worker = true;
+    session->allow = true;
+    session->decision_ready = true;
+    pthread_cond_broadcast(&session->cond);
+    if (!has_pending && listener_fd >= 0) {
+        close(listener_fd);
+        session->listener_fd = -1;
+    }
+    pthread_mutex_unlock(&session->mutex);
+
+    if (worker_running) {
+        pthread_join(session->worker_thread, NULL);
+    }
+
+    pthread_mutex_lock(&session->mutex);
+    session->stop_worker = false;
+    session->has_pending = false;
+    session->decision_ready = false;
+    memset(&session->pending, 0, sizeof(session->pending));
+    memset(&session->current_notif, 0, sizeof(session->current_notif));
+    pthread_mutex_unlock(&session->mutex);
+}
+
+static int start_active_session(struct active_session* session, int listener_fd, int txn_map_fd)
+{
+    stop_active_session(session);
+
+    pthread_mutex_lock(&session->mutex);
+    session->listener_fd = listener_fd;
+    session->txn_map_fd = txn_map_fd;
+    session->stop_worker = false;
+    session->has_pending = false;
+    session->decision_ready = false;
+    if (pthread_create(&session->worker_thread, NULL, active_session_thread, session) != 0) {
+        int saved = errno;
+        close(listener_fd);
+        session->listener_fd = -1;
+        pthread_mutex_unlock(&session->mutex);
+        errno = saved;
+        return -1;
+    }
+    session->worker_running = true;
+    pthread_mutex_unlock(&session->mutex);
+    return 0;
+}
+
+static int update_target_map_for_pid(int target_map_fd, uint32_t pid)
+{
+    uint64_t cgroup_id = 0;
+    uint32_t zero = 0;
+    if (pid == 0) {
+        if (sys_bpf_map_update_elem(target_map_fd, &zero, &cgroup_id, 0) != 0) {
+            fprintf(stderr, "proxy: SET_TARGET clear failed: %s\n", strerror(errno));
+            return -1;
+        }
+        fprintf(stdout, "proxy: monitoring disabled\n");
+        fflush(stdout);
+        return 0;
+    }
+
+    char cgroup_path[PATH_MAX];
+    struct stat st;
+    if (read_cgroup_path_for_pid((pid_t)pid, cgroup_path, sizeof(cgroup_path)) != 0 ||
+        stat(cgroup_path, &st) != 0) {
+        fprintf(stderr, "proxy: SET_TARGET pid=%u cgroup resolve failed: %s\n",
+                pid, strerror(errno));
+        return -1;
+    }
+
+    cgroup_id = (uint64_t)st.st_ino;
+    if (sys_bpf_map_update_elem(target_map_fd, &zero, &cgroup_id, 0) != 0) {
+        fprintf(stderr, "proxy: SET_TARGET map update failed: %s\n", strerror(errno));
+        return -1;
+    }
+
+    fprintf(stdout, "proxy: monitoring pid=%u cgroup=%s id=%llu\n",
+            pid, cgroup_path, (unsigned long long)cgroup_id);
+    fflush(stdout);
+    return 0;
+}
+
+static void handle_proxy_client(struct proxy_client_args* args)
+{
+    struct active_session* session = &args->session;
+    int client_fd = args->client_fd;
     uint8_t msg_type;
     while (read_full(client_fd, &msg_type, 1) == 1) {
         if (msg_type == PROXY_MSG_SET_TARGET) {
@@ -299,39 +570,84 @@ static void handle_proxy_client(int client_fd, int txn_map_fd, int target_map_fd
             if (read_full(client_fd, &pid, sizeof(pid)) != (ssize_t)sizeof(pid)) {
                 break;
             }
-            uint64_t cgroup_id = 0;
             uint8_t ok = 1;
-            if (pid == 0) {
-                /* clear filter */
-                uint32_t zero = 0;
-                if (sys_bpf_map_update_elem(target_map_fd, &zero, &cgroup_id, 0) != 0) {
-                    fprintf(stderr, "proxy: SET_TARGET clear failed: %s\n", strerror(errno));
-                    ok = 0;
-                } else {
-                    fprintf(stdout, "proxy: monitoring disabled\n");
-                    fflush(stdout);
-                }
+            if (update_target_map_for_pid(args->target_map_fd, pid) != 0) {
+                ok = 0;
             } else {
-                char cgroup_path[PATH_MAX];
-                struct stat st;
-                if (read_cgroup_path_for_pid((pid_t)pid, cgroup_path, sizeof(cgroup_path)) != 0 ||
-                    stat(cgroup_path, &st) != 0) {
-                    fprintf(stderr, "proxy: SET_TARGET pid=%u cgroup resolve failed: %s\n",
-                            pid, strerror(errno));
-                    ok = 0;
-                } else {
-                    cgroup_id = (uint64_t)st.st_ino;
-                    uint32_t zero = 0;
-                    if (sys_bpf_map_update_elem(target_map_fd, &zero, &cgroup_id, 0) != 0) {
-                        fprintf(stderr, "proxy: SET_TARGET map update failed: %s\n", strerror(errno));
-                        ok = 0;
-                    } else {
-                        fprintf(stdout, "proxy: monitoring pid=%u cgroup=%s id=%llu\n",
-                                pid, cgroup_path, (unsigned long long)cgroup_id);
-                        fflush(stdout);
-                    }
-                }
+                args->target_pid = pid;
             }
+            if (write_full(client_fd, &ok, 1) != 1) {
+                break;
+            }
+        } else if (msg_type == PROXY_MSG_REGISTER_LISTENER) {
+            int listener_fd = -1;
+            int status = recv_fd_with_status(client_fd, &listener_fd);
+            uint8_t ok = 1;
+            if (status != 0 || listener_fd < 0) {
+                fprintf(stderr, "proxy: register listener recv failed status=%d fd=%d\n", status, listener_fd);
+                ok = 0;
+            } else if (start_active_session(session, listener_fd, args->txn_map_fd) != 0) {
+                fprintf(stderr, "proxy: register listener failed: %s\n", strerror(errno));
+                ok = 0;
+            } else {
+                fprintf(stdout, "proxy: listener registered fd=%d\n", listener_fd);
+                fflush(stdout);
+            }
+            if (write_full(client_fd, &ok, 1) != 1) {
+                break;
+            }
+        } else if (msg_type == PROXY_MSG_GET_PENDING) {
+            uint8_t found = 0;
+            struct proxy_pending_request pending;
+            memset(&pending, 0, sizeof(pending));
+            pthread_mutex_lock(&session->mutex);
+            if (session->has_pending) {
+                found = 1;
+                pending = session->pending;
+            }
+            pthread_mutex_unlock(&session->mutex);
+            fprintf(stdout,
+                    "proxy: GET_PENDING found=%u notification_id=%llu tid=%u\n",
+                    found,
+                    (unsigned long long)pending.notification_id,
+                    pending.pid);
+            fflush(stdout);
+            if (write_full(client_fd, &found, 1) != 1) {
+                break;
+            }
+            if (write_full(client_fd, &pending, sizeof(pending)) != (ssize_t)sizeof(pending)) {
+                break;
+            }
+        } else if (msg_type == PROXY_MSG_SEND_DECISION) {
+            uint64_t notification_id = 0;
+            int32_t allow = 0;
+            uint8_t ok = 1;
+            if (read_full(client_fd, &notification_id, sizeof(notification_id)) != (ssize_t)sizeof(notification_id) ||
+                read_full(client_fd, &allow, sizeof(allow)) != (ssize_t)sizeof(allow)) {
+                break;
+            }
+            pthread_mutex_lock(&session->mutex);
+            if (!session->has_pending ||
+                session->pending.notification_id != notification_id) {
+                ok = 0;
+            } else {
+                session->allow = allow != 0;
+                session->decision_ready = true;
+                pthread_cond_broadcast(&session->cond);
+            }
+            pthread_mutex_unlock(&session->mutex);
+            fprintf(stdout,
+                    "proxy: SEND_DECISION id=%llu allow=%d ok=%u\n",
+                    (unsigned long long)notification_id,
+                    allow,
+                    ok);
+            fflush(stdout);
+            if (write_full(client_fd, &ok, 1) != 1) {
+                break;
+            }
+        } else if (msg_type == PROXY_MSG_UNREGISTER) {
+            uint8_t ok = 1;
+            stop_active_session(session);
             if (write_full(client_fd, &ok, 1) != 1) {
                 break;
             }
@@ -343,7 +659,7 @@ static void handle_proxy_client(int client_fd, int txn_map_fd, int target_map_fd
             uint8_t found = 0;
             struct binder_txn_info info;
             memset(&info, 0, sizeof(info));
-            if (sys_bpf_map_lookup_and_delete_elem(txn_map_fd, &tid, &info) == 0) {
+            if (sys_bpf_map_lookup_and_delete_elem(args->txn_map_fd, &tid, &info) == 0) {
                 found = 1;
             } else if (errno != ENOENT) {
                 fprintf(stderr, "proxy: lookup tid=%u: %s\n", tid, strerror(errno));
@@ -361,16 +677,16 @@ static void handle_proxy_client(int client_fd, int txn_map_fd, int target_map_fd
     }
 }
 
-struct proxy_client_args {
-    int client_fd;
-    int txn_map_fd;
-    int target_map_fd;
-};
-
 static void* handle_proxy_client_thread(void* opaque)
 {
     struct proxy_client_args* args = (struct proxy_client_args*)opaque;
-    handle_proxy_client(args->client_fd, args->txn_map_fd, args->target_map_fd);
+    handle_proxy_client(args);
+    stop_active_session(&args->session);
+    if (args->target_pid != 0) {
+        update_target_map_for_pid(args->target_map_fd, 0);
+    }
+    pthread_mutex_destroy(&args->session.mutex);
+    pthread_cond_destroy(&args->session.cond);
     close(args->client_fd);
     free(args);
     return NULL;
@@ -658,6 +974,22 @@ static int do_serve(const struct options* options)
         client_args->client_fd = client_fd;
         client_args->txn_map_fd = txn_map_fd;
         client_args->target_map_fd = target_map_fd;
+        client_args->target_pid = 0;
+        client_args->session.listener_fd = -1;
+        client_args->session.txn_map_fd = -1;
+        if (pthread_mutex_init(&client_args->session.mutex, NULL) != 0) {
+            fprintf(stderr, "serve: session init failed\n");
+            close(client_fd);
+            free(client_args);
+            continue;
+        }
+        if (pthread_cond_init(&client_args->session.cond, NULL) != 0) {
+            fprintf(stderr, "serve: session init failed\n");
+            pthread_mutex_destroy(&client_args->session.mutex);
+            close(client_fd);
+            free(client_args);
+            continue;
+        }
 
         pthread_t thread;
         int rc = pthread_create(&thread, NULL, handle_proxy_client_thread, client_args);

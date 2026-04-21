@@ -9,11 +9,4 @@ interface ISeccompPolicyDaemon {
             String description,
             int targetPid);
     void unregisterSession(String sessionId);
-    void publishPendingRequest(
-            String sessionId,
-            long notificationId,
-            int pid,
-            int syscallNr,
-            long ioctlCmd);
-    int getDecision(String sessionId, long notificationId);
 }

@@ -2,6 +2,7 @@
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
+    android:background="#000000"
     android:orientation="vertical"
     android:padding="20dp">
 
@@ -10,7 +11,9 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:text="No active sessions."
-        android:textAppearance="?attr/textAppearanceHeadlineSmall" />
+        android:textAppearance="?attr/textAppearanceHeadlineSmall"
+        android:textColor="#3CFF6B"
+        android:textStyle="bold" />
 
     <TextView
         android:id="@+id/detailText"
@@ -18,7 +21,8 @@
         android:layout_height="wrap_content"
         android:layout_marginTop="8dp"
         android:text="Bind from the demo app, then review pending seccomp notifications here."
-        android:textAppearance="?attr/textAppearanceBodyMedium" />
+        android:textAppearance="?attr/textAppearanceBodyMedium"
+        android:textColor="#3CFF6B" />
 
     <androidx.recyclerview.widget.RecyclerView
         android:id="@+id/requestsList"
