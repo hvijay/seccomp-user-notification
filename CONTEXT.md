@@ -4,191 +4,293 @@
 
 - Repo: `/home/hayawardh/git/seccomp-user-notification`
 - Branch: `master`
-- Last commit: `48df96f` (`Checkpoint Binder LSM monitor prototype`)
-- All current work is **uncommitted**
+- Current commit: `04a881b` (`Fix loader session cleanup for repeated demo runs`)
+- Worktree status at handoff: `CONTEXT.md` modified, not yet committed
 
-## Architecture overview
+## Current architecture
 
+This is now closer to the intended production split:
+
+```text
+demoapp
+  - installs seccomp user-notify filter
+  - forks child that issues the raw Binder ioctl
+  - transfers seccomp listener fd to policydaemon over AIDL
+  - waits for child result only
+
+policydaemon
+  - UI/control process only
+  - receives listener fd from demoapp
+  - forwards listener fd to binder_monitor_loader over Unix socket + SCM_RIGHTS
+  - polls loader for pending requests
+  - shows allow/deny UI
+  - sends decisions back to loader
+
+binder_monitor_loader
+  - root daemon
+  - loads and owns the eBPF programs/maps
+  - arms target cgroup monitoring
+  - owns seccomp RECV/SEND after fd handoff
+  - looks up Binder metadata from txn_map
+  - holds per-session pending seccomp state
 ```
-demoapp (JNI)
-  └─ installs seccomp BINDER_WRITE_READ filter on forked child
-  └─ forks child, child waits on go-pipe
-  └─ calls daemon.registerSession(sessionId, listenerFd, description, myPid)
-       └─ policydaemon JNI: nativeStartListener()
-            └─ connects to /data/local/tmp/binder_monitor_proxy.sock
-            └─ sends PROXY_MSG_SET_TARGET(myPid)  ← arms BPF cgroup filter
-  └─ after registerSession returns, triggers child via go-pipe
-  └─ child opens /dev/binder, issues raw BC_TRANSACTION ioctl(BINDER_WRITE_READ)
-       └─ BPF tracepoint fires at sys_enter → stores to txn_map[child_tid]
-       └─ seccomp filter fires → child frozen
-  └─ policydaemon ListenerMain receives SECCOMP_IOCTL_NOTIF_RECV
-       └─ calls LookupTransactionForTid(proxy_fd, request.pid)
-            └─ sends PROXY_MSG_LOOKUP_TID(tid) to loader proxy
-            └─ loader looks up txn_map[tid], returns binder_txn_info
-       └─ if found → DeliverNotification → UI shows allow/deny
-       └─ if not found → SECCOMP_USER_NOTIF_FLAG_CONTINUE (auto-allow)
+
+## What is verified working
+
+### End-to-end seccomp allow flow
+
+Verified on the attached rooted device with `adb` only:
+
+1. start long-lived `binder_monitor_loader daemon`
+2. start `policydaemon`
+3. run `demoapp`
+4. loader receives seccomp notification for the child Binder ioctl
+5. `policydaemon` shows a pending request
+6. send `allow`
+7. loader sends seccomp response
+8. child completes and `demoapp` launches the visible browser action
+
+Observed loader trace from a good run:
+
+```text
+proxy: monitoring pid=12399 cgroup=/sys/fs/cgroup/apps/uid_10339/pid_12399 id=28388
+proxy: listener registered fd=8
+proxy: worker started listener_fd=8 txn_map_fd=3
+proxy: waiting for seccomp notification fd=8
+proxy: received seccomp notification id=... pid=12473 nr=29 arg1=3224396289
+proxy: pending notification id=... tid=12473 iface='' action='' uri=''
+proxy: sending seccomp response id=... allow=1
+proxy: waiting for seccomp notification fd=8
+proxy: SECCOMP_IOCTL_NOTIF_RECV failed: No such file or directory
+proxy: worker exiting
+proxy: monitoring disabled
 ```
 
-## Components
+`policydaemon` showed:
 
-### kernel/binder_monitor.bpf.c
+```text
+Pending Binder request from tid=12473 (target pid=12399). Tap allow or deny.
+```
 
-- Attached to `tracepoint/raw_syscalls/sys_enter`
-- Filters: ARM64 ioctl nr (29), cgroup check, BINDER_WRITE_READ cmd, BC_TRANSACTION bcmd
-- Cgroup filter: reads `target_cgroup_map[0]` (u64); 0 = monitoring disabled
-- On match: reads bwr struct, reads BC_TRANSACTION txn, parses parcel, writes to `txn_map[tid]`
-- Maps:
-  - `target_cgroup_map` (ARRAY, 1 entry, u32→u64)
-  - `scratch` (PERCPU_ARRAY, scratch space)
-  - `txn_map` (HASH, max 64 entries, keyed by u32 tid)
-- Currently has `bpf_printk` debug statements at cgroup check and txn record points
+`demoapp` finished with:
 
-### loader/src/binder_monitor_loader.c
+```text
+Binder VIEW transaction submitted (seccomp allowed).
+```
 
-- Runs as root daemon: `adb shell "su root sh -c 'nohup /data/local/tmp/binder_monitor_loader daemon > /data/local/tmp/loader_daemon.log 2>&1 &'"`
-- Loads `binder_monitor.bpf.o`, starts with `target_cgroup_id=0` (idle)
-- Pins maps and link under `/sys/fs/bpf/binder_monitor/`
-- Listens on `/data/local/tmp/binder_monitor_proxy.sock`
-- Proxy protocol (framed, over persistent TCP-like Unix stream):
-  - `PROXY_MSG_SET_TARGET (0x01)` + u32 pid → resolves cgroup, updates `target_cgroup_map`, returns u8 ok
-  - `PROXY_MSG_LOOKUP_TID (0x02)` + u32 tid → looks up `txn_map[tid]`, returns u8 found + binder_txn_info
+### Repeated demo runs without restarting loader
 
-### policydaemon/src/main/cpp/seccomp_policy_jni.cpp
+This was the main verified fix in `04a881b`.
 
-- `nativeStartListener(sessionId, fd, targetPid)`:
-  - Connects to proxy socket
-  - Sends `PROXY_MSG_SET_TARGET(targetPid)`
-  - Stores session in `g_sessions`, starts `ListenerMain` thread
-- `ListenerMain`: loops on `SECCOMP_IOCTL_NOTIF_RECV`, calls `LookupTransactionForTid` via proxy, auto-allows if not found, delivers to Java if found
-- `nativeStopListener`: sends `PROXY_MSG_SET_TARGET(0)` before closing
-- **fdsan fix**: JNI never closes the listener fd on failure paths; Kotlin closes it in the `!ok` branch
+Tested sequence:
 
-### demoapp/src/main/cpp/seccomp_demo_jni.cpp
+1. keep one long-lived loader instance running
+2. run demo once and allow it
+3. force-stop only `demoapp`
+4. run demo again without restarting loader or `policydaemon`
+5. allow again
 
-- `installFilterForkAndTriggerIntent()`:
-  - Installs `SECCOMP_RET_USER_NOTIF` filter on `ioctl(BINDER_WRITE_READ)`
-  - Forks child; child waits on go-pipe
-  - Returns `[listenerFd, childPid, resultReadFd, goWriteFd]`
-- `DoBinderTransaction()` (child side):
-  - Reads go-pipe (waits for BPF to be armed)
-  - Prints own pid + `/proc/self/cgroup` to result pipe (debug)
-  - Opens `/dev/binder`, builds raw `BC_TRANSACTION` parcel
-  - Parcel layout: `strict_mode(u32) | work_source_uid(u32) | interface(str16) | action(str16) | uri(str16) | pkg(str16)`
-  - Calls `ioctl(BINDER_WRITE_READ)` → intercepted by seccomp
-- `triggerChild(goWriteFd)`: unblocks the waiting child after session registration
-- **go-pipe purpose**: ensures `SET_TARGET` completes and BPF filter is armed before child makes ioctl
+Result:
 
-### demoapp/src/main/java/.../MainActivity.kt
+- second run successfully created a fresh loader session
+- second run surfaced a fresh pending request in `policydaemon`
+- second run completed successfully after allow
 
-- Passes `android.os.Process.myPid()` (not child PID) to `registerSession` so loader targets the demoapp's stable cgroup (which child inherits at fork)
-- After successful `registerSession`: calls `NativeSeccompBridge.triggerChild(goWriteFd)`
-- After failed `registerSession`: also calls `triggerChild` to unblock and discard child
+Observed loader trace from second run:
 
-## Build commands
+```text
+proxy: monitoring pid=12838 cgroup=/sys/fs/cgroup/apps/uid_10339/pid_12838 id=28444
+proxy: listener registered fd=8
+proxy: worker started listener_fd=8 txn_map_fd=3
+proxy: waiting for seccomp notification fd=8
+proxy: received seccomp notification id=... pid=12939 nr=29 arg1=3224396289
+proxy: pending notification id=... tid=12939 iface='' action='' uri=''
+proxy: sending seccomp response id=... allow=1
+proxy: waiting for seccomp notification fd=8
+proxy: SECCOMP_IOCTL_NOTIF_RECV failed: No such file or directory
+proxy: worker exiting
+proxy: monitoring disabled
+```
+
+So repeated runs now work.
+
+## Main code shape
+
+### Loader
+
+File:
+
+- `loader/src/binder_monitor_loader.c`
+
+Important current behavior:
+
+- each proxy client has its own `struct active_session`
+- no more global singleton session state
+- `REGISTER_LISTENER` starts a per-client worker thread
+- worker thread does:
+  - `SECCOMP_IOCTL_NOTIF_RECV`
+  - lookup-and-delete from `txn_map`
+  - hold pending request
+  - wait for decision
+  - `SECCOMP_IOCTL_NOTIF_SEND`
+- client disconnect / unregister cleans up only that client session
+- `SET_TARGET(0)` disables monitoring on session teardown
+
+### Policydaemon
+
+Files:
+
+- `policydaemon/src/main/java/com/example/seccomp/policydaemon/SeccompRepository.kt`
+- `policydaemon/src/main/java/com/example/seccomp/policydaemon/PolicyDaemonService.kt`
+- `policydaemon/src/main/cpp/seccomp_policy_jni.cpp`
+
+Important current behavior:
+
+- receives listener fd from `demoapp`
+- forwards it to loader using `PROXY_MSG_REGISTER_LISTENER`
+- polls loader with `PROXY_MSG_GET_PENDING`
+- sends decisions with `PROXY_MSG_SEND_DECISION`
+- UI is black/green themed with allow/deny controls
+- repeated runs are now working against one long-lived loader
+
+### Demoapp
+
+File:
+
+- `demoapp/src/main/java/com/example/seccomp/demoapp/MainActivity.kt`
+
+Important current behavior:
+
+- no longer does local seccomp `RECV`/`SEND`
+- creates seccomp listener fd and child
+- registers session with `policydaemon`
+- transfers listener ownership away
+- waits for child result only
+- after allow, launches visible browser `ACTION_VIEW`
+
+## Remaining blocker
+
+### Binder-derived metadata is still mostly blank
+
+The policy flow works, but the user-facing Binder metadata shown in `policydaemon` is not yet trustworthy.
+
+Current observed pending row fields:
+
+```text
+binder_interface=
+binder_code=0
+intent_action=
+intent_uri=
+```
+
+Loader trace also shows:
+
+```text
+proxy: pending notification id=... tid=... iface='' action='' uri=''
+```
+
+So:
+
+- seccomp interception works
+- repeated runs work
+- pending allow/deny UI works
+- but `txn_map` enrichment is not reliably producing the expected `VIEW https://example.com/` metadata at decision time
+
+This is the main remaining technical gap.
+
+## Likely next debugging direction
+
+Focus on why `fill_pending_request()` gets an empty `binder_txn_info` for the intercepted child tid.
+
+Relevant code path:
+
+1. BPF program writes `txn_map[tid]`
+2. loader worker receives seccomp notif for pid/tid
+3. `fill_pending_request()` does `sys_bpf_map_lookup_and_delete_elem(txn_map_fd, &pending->pid, &pending->txn)`
+4. UI shows whatever came back
+
+Potential causes to check:
+
+- wrong key being used at lookup time
+- `txn_map` entry not yet present when seccomp notification is received
+- BPF parser not recognizing the current Binder parcel shape
+- `lookup_and_delete` returning zeroed or partial data
+- unrelated Binder traffic for the same process overwriting or racing before lookup
+
+The current loader logging is useful for this and should probably stay until metadata is fixed:
+
+- worker start
+- wait for seccomp
+- received seccomp notif
+- pending notification with parsed iface/action/uri
+- get-pending / send-decision logging
+
+## Useful commands
+
+### Build
 
 ```bash
-# BPF object
 bash scripts/build_bpf.sh
-# Output: kernel/binder_monitor.bpf.o
-
-# Loader binary (root daemon)
 bash scripts/build_loader.sh
-# Output: loader/out/android-arm64/binder_monitor_loader
-
-# Android apps
-/tmp/gradle-8.7/bin/gradle :demoapp:assembleDebug
-/tmp/gradle-8.7/bin/gradle :policydaemon:assembleDebug
+/tmp/gradle-8.7/bin/gradle :demoapp:assembleDebug :policydaemon:assembleDebug
 ```
 
-## Deploy sequence
+### Deploy
 
 ```bash
-# Push BPF + loader
 adb push kernel/binder_monitor.bpf.o /data/local/tmp/
 adb push loader/out/android-arm64/binder_monitor_loader /data/local/tmp/
 adb shell su root chmod +x /data/local/tmp/binder_monitor_loader
 
-# Start loader daemon (must be root, must persist across adb disconnect)
-adb shell su root pkill -f binder_monitor_loader
-adb shell "su root sh -c 'nohup /data/local/tmp/binder_monitor_loader daemon > /data/local/tmp/loader_daemon.log 2>&1 &'"
-
-# Install APKs
 adb install -r demoapp/build/outputs/apk/debug/demoapp-debug.apk
 adb install -r policydaemon/build/outputs/apk/debug/policydaemon-debug.apk
 ```
 
-## Device state
+### Start loader in foreground for debugging
 
-- Attached Android device via adb
-- Rooted (su root works)
-- Android 15 debug kernel, BTF present, bpffs mounted, cgroupv2 available
-- cgroupv2 NOT mounted at /sys/fs/cgroup directly — it's a hybrid v1/v2 setup:
-  - v2 (unified): `0::/apps/uid_XXXXX/pid_YYYYY`
-  - v1 controllers: cpuset, cpu, cpuacct, blkio, freezer
-  - Loader path: `/sys/fs/cgroup` + path from `0::` line in `/proc/PID/cgroup`
+This was the most reliable way to observe loader state:
 
-## Current status
+```bash
+adb shell su root /data/local/tmp/binder_monitor_loader daemon
+```
 
-### What works
+### Start apps
 
-- BPF loads, attaches, fires ✓
-- Loader daemon receives `SET_TARGET`, resolves cgroup id, updates `target_cgroup_map` ✓
-- Cgroup ID comparison in BPF working — confirmed via `bpf_printk`:
-  - `binder_monitor: ioctl cgroup cur=32681 target=32681` (for demoapp's own threads) ✓
-- `BINDER_WRITE_READ = 0xc0306201` matches correctly ✓
-- `BC_TRANSACTION = 0x40406300` recorded for demoapp's own binder calls ✓
-- seccomp filter intercepts child's `ioctl(BINDER_WRITE_READ)` (child gets auto-allowed) ✓
-- go-pipe timing: child waits for BPF to be armed before making ioctl ✓
-- fdsan double-close crash fixed ✓
-- Raw Binder transaction works (no am start, no SecurityException) ✓
+```bash
+adb shell am start-foreground-service -n com.example.seccomp.policydaemon/.PolicyDaemonService
+adb shell am start -n com.example.seccomp.demoapp/.MainActivity -a com.example.seccomp.demoapp.action.RUN_DEMO
+```
 
-### Current blocker
+### Allow first pending request
 
-**The BPF does not record the forked child's `BINDER_WRITE_READ` ioctl.**
+```bash
+adb shell am start-foreground-service \
+  -n com.example.seccomp.policydaemon/.PolicyDaemonService \
+  -a com.example.seccomp.policydaemon.action.COMMAND \
+  --es decision allow
+```
 
-Evidence:
-- `LookupTransactionForTid` returns `found=false` → seccomp auto-allows via `SECCOMP_USER_NOTIF_FLAG_CONTINUE`
-- Trace shows NO `binder_monitor: ioctl cgroup cur=32681` entries for the child's TID
-- Yet the child IS in the correct cgroup:
-  - Child (e.g. pid=23298) cgroup from `/proc/self/cgroup`: `0::/apps/uid_10402/pid_23228`
-  - Demoapp (pid=23228) cgroup: same path → id=32765
-  - Loader confirmed: `proxy: monitoring pid=23228 cgroup=/sys/fs/cgroup/apps/uid_10402/pid_23228 id=32765`
+### Inspect app debug providers
 
-### Hypotheses for child's ioctl not appearing in trace
+```bash
+adb shell content query --uri content://com.example.seccomp.demoapp.debug/status
+adb shell content query --uri content://com.example.seccomp.demoapp.debug/events
+adb shell content query --uri content://com.example.seccomp.policydaemon.debug/status
+adb shell content query --uri content://com.example.seccomp.policydaemon.debug/pending
+```
 
-1. **`bpf_printk` per-CPU buffer overflow**: so many ioctls from other processes hit the cgroup check that the child's printk is dropped from the ring buffer before we read it — but this wouldn't explain why `txn_map` has no entry for the child's TID
-2. **`bpf_map_update_elem` fails silently**: txn_map is full (64 entries, hash map) when child's ioctl fires — other threads from demoapp/RenderThread are flooding it
-3. **`sys_enter` tracepoint fires AFTER seccomp on this kernel**: if seccomp suspends the child before `sys_enter` fires, the BPF never runs for that ioctl
-4. **Child is moved to a new cgroup between the debug print and the actual ioctl**: `DoBinderTransaction` prints cgroup, then opens `/dev/binder`, then calls `ioctl(BINDER_VERSION)`, then `ioctl(BINDER_SET_MAX_THREADS)`, then `ioctl(BINDER_WRITE_READ)` — Android could move the child during this window
+### Inspect BPF txn map
 
-### Most likely root cause
+```bash
+adb shell su root bpftool map dump pinned /sys/fs/bpf/binder_monitor/txn_map
+```
 
-Hypothesis 3 (tracepoint vs seccomp ordering) is most concerning. On some kernels, seccomp runs before the raw_syscalls tracepoint. If so, the BPF program never fires for syscalls that seccomp intercepts.
+## Summary
 
-### Suggested next investigation
+At this handoff point:
 
-1. **Verify ordering**: Add a BPF program that fires on `raw_syscalls/sys_exit` too, and check if the child's ioctl appears in `sys_exit` after being released by the policydaemon. If `sys_exit` fires but `sys_enter` didn't record → ordering issue.
-
-2. **Check txn_map from root immediately after demo trigger**:
-   ```bash
-   adb shell su root bpftool map dump pinned /sys/fs/bpf/binder_monitor/txn_map
-   ```
-   If child's tid is in the map but lookup fails → protocol issue in loader proxy.
-   If child's tid is NOT in the map → BPF never fired for it.
-
-3. **Add bpf_printk with no cgroup filter** (temporarily set cgroup filter to match all):
-   Change `target_cgroup_id == 0 → return 0` to log all ioctl syscalls → confirm BPF fires for child.
-
-4. **Alternative hook**: Use `kprobe/binder_ioctl` instead of `raw_syscalls/sys_enter` — kprobes fire inside the kernel after seccomp has already allowed the syscall to proceed, so ordering is not an issue.
-
-## Pinned files on device
-
-- `/data/local/tmp/binder_monitor.bpf.o`
-- `/data/local/tmp/binder_monitor_loader`
-- `/data/local/tmp/binder_monitor_proxy.sock` (runtime, created by loader daemon)
-- `/data/local/tmp/loader_daemon.log`
-- `/sys/fs/bpf/binder_monitor/link`
-- `/sys/fs/bpf/binder_monitor/txn_map`
-- `/sys/fs/bpf/binder_monitor/target_cgroup_map`
-</content>
-</invoke>
+- production-like ownership split is implemented
+- loader owns seccomp receive/respond
+- policydaemon is effectively UI/control
+- repeated runs are fixed and verified
+- remaining blocker is Binder metadata enrichment, not the seccomp/session architecture
