@@ -10,74 +10,25 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:background="#111D31"
-        android:gravity="center_vertical"
-        android:orientation="horizontal"
+        android:orientation="vertical"
         android:padding="16dp">
 
-        <LinearLayout
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:orientation="vertical">
-
-            <TextView
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="Atlas Agent"
-                android:textColor="#F4F7FB"
-                android:textSize="28sp"
-                android:textStyle="bold" />
-
-            <TextView
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="4dp"
-                android:text="Ask for a hardcoded action and wait for policy approval."
-                android:textColor="#A8BBCE"
-                android:textSize="14sp" />
-        </LinearLayout>
-
-        <LinearLayout
+        <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:gravity="end"
-            android:orientation="vertical">
+            android:text="Demo AI Agent"
+            android:textColor="#F4F7FB"
+            android:textSize="28sp"
+            android:textStyle="bold" />
 
-            <Button
-                android:id="@+id/openDaemonButton"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:backgroundTint="#26364F"
-                android:text="Open Policy"
-                android:textAllCaps="false"
-                android:textColor="#F4F7FB" />
-
-            <Button
-                android:id="@+id/bindDaemonButton"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="8dp"
-                android:backgroundTint="#1D8F6B"
-                android:text="Reconnect"
-                android:textAllCaps="false"
-                android:textColor="#F4F7FB" />
-        </LinearLayout>
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="Pick an action below and wait for approval."
+            android:textColor="#A8BBCE"
+            android:textSize="14sp" />
     </LinearLayout>
-
-    <TextView
-        android:id="@+id/connectionStatusText"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="12dp"
-        android:background="#12263D"
-        android:paddingLeft="12dp"
-        android:paddingTop="8dp"
-        android:paddingRight="12dp"
-        android:paddingBottom="8dp"
-        android:text="Waiting for policy daemon"
-        android:textColor="#FFB84D"
-        android:textSize="13sp"
-        android:textStyle="bold" />
 
     <androidx.core.widget.NestedScrollView
         android:id="@+id/chatScroll"

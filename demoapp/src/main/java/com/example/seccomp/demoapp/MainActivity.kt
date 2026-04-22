@@ -62,8 +62,6 @@ class MainActivity : AppCompatActivity() {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
             daemon = ISeccompPolicyDaemon.Stub.asInterface(service)
             bound = true
-            binding.connectionStatusText.text = "Policy daemon connected"
-            binding.connectionStatusText.setTextColor(0xFF63F29A.toInt())
             updateActionButtons()
             maybeRunPendingAutoAction()
         }
@@ -71,8 +69,6 @@ class MainActivity : AppCompatActivity() {
         override fun onServiceDisconnected(name: ComponentName?) {
             daemon = null
             bound = false
-            binding.connectionStatusText.text = "Waiting for policy daemon"
-            binding.connectionStatusText.setTextColor(0xFFFFB84D.toInt())
             updateActionButtons()
         }
     }
@@ -81,16 +77,6 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
-
-        binding.openDaemonButton.setOnClickListener {
-            val intent = Intent().setClassName(
-                ServiceContract.DAEMON_PACKAGE,
-                ServiceContract.DAEMON_ACTIVITY,
-            )
-            runCatching { startActivity(intent) }
-                .onFailure { showToast("Policy daemon app is not installed.") }
-        }
-        binding.bindDaemonButton.setOnClickListener { bindToDaemon() }
 
         binding.calendarActionButton.setOnClickListener { runAgentAction(AgentAction.PRINT_CALENDAR) }
         binding.browserActionButton.setOnClickListener { runAgentAction(AgentAction.OPEN_BROWSER) }
@@ -126,7 +112,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun seedConversation() {
-        addAssistantMessage("Atlas is ready. Pick a hardcoded action below and I’ll request approval before it runs.")
+        addAssistantMessage("Demo AI Agent is ready. Pick an action below.")
         addAssistantMessage("Try: print your calendar, open a browser tab, read CONTEXT.md, or run a curl web search.")
     }
 
@@ -143,12 +129,7 @@ class MainActivity : AppCompatActivity() {
         val intent = Intent(ServiceContract.DAEMON_BIND_ACTION).apply {
             setClassName(ServiceContract.DAEMON_PACKAGE, ServiceContract.DAEMON_SERVICE)
         }
-        val ok = bindService(intent, connection, Context.BIND_AUTO_CREATE)
-        if (!ok) {
-            binding.connectionStatusText.text = "Bind failed"
-            binding.connectionStatusText.setTextColor(0xFFFF7272.toInt())
-            addAssistantMessage("I couldn’t bind to the policy daemon. Open it first, then reconnect.")
-        }
+        bindService(intent, connection, Context.BIND_AUTO_CREATE)
     }
 
     private fun handleLaunchIntent(intent: Intent?) {
@@ -157,7 +138,6 @@ class MainActivity : AppCompatActivity() {
         if (bound) {
             maybeRunPendingAutoAction()
         } else {
-            addAssistantMessage("Auto-run requested. Waiting for the policy daemon connection first.")
             bindToDaemon()
         }
     }
@@ -174,7 +154,7 @@ class MainActivity : AppCompatActivity() {
         clearResponse()
 
         val currentDaemon = daemon ?: run {
-            addAssistantMessage("The policy daemon is not connected yet.")
+            addAssistantMessage("Not ready yet. Please wait a moment and try again.")
             return
         }
 
@@ -182,7 +162,6 @@ class MainActivity : AppCompatActivity() {
         lastResultMessage = null
         updateActionButtons()
         DebugStateStore.updateStatus("Requesting ${action.prompt}")
-        addAssistantMessage("Preparing “${action.prompt}” and handing approval to the policy daemon.")
 
         lifecycleScope.launch {
             val result = withContext(Dispatchers.IO) {
@@ -238,15 +217,10 @@ class MainActivity : AppCompatActivity() {
                 ParcelFileDescriptor.fromFd(localListenerFd).use { pfd ->
                     currentDaemon.registerSession(sessionId, pfd, description, childPid)
                 }
-            }.getOrElse { error ->
-                addAssistantMessage("Failed to send the listener FD to the policy daemon: ${error.message}")
-                false
-            }
+            }.getOrElse { false }
 
-            if (registered) {
-                addAssistantMessage("Approval requested. Review the action in the policy daemon for child pid=$childPid.")
-            } else {
-                addAssistantMessage("The policy daemon rejected the listener registration.")
+            if (!registered) {
+                addAssistantMessage("Could not request approval. Please try again.")
             }
 
             if (goWriteFd >= 0) {
@@ -278,7 +252,7 @@ class MainActivity : AppCompatActivity() {
         updateActionButtons()
 
         if (outcome.contains("denied", ignoreCase = true)) {
-            addAssistantMessage("The policy daemon denied “${action.prompt}”.")
+            addAssistantMessage("${action.prompt} was denied.")
             return
         }
 
