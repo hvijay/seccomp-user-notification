@@ -42,11 +42,8 @@ class PolicyDebugProvider : ContentProvider() {
 
             "pending" -> MatrixCursor(
                 arrayOf(
-                    "notification_key",
-                    "session_id",
                     "notification_id",
                     "tid",
-                    "target_pid",
                     "monitor_status",
                     "binder_interface",
                     "binder_code",
@@ -57,11 +54,8 @@ class PolicyDebugProvider : ContentProvider() {
                 snapshot.pendingRequests.forEach { request ->
                     addRow(
                         arrayOf(
-                            "${request.sessionId}:${request.notificationId}",
-                            request.sessionId,
                             request.notificationId,
                             request.pid,
-                            request.targetPid,
                             request.monitorStatus,
                             request.binderInterface,
                             request.binderCode,

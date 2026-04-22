@@ -229,6 +229,8 @@ The current loader logging is useful for this and should probably stay until met
 
 ### Build
 
+> **Note:** Gradle is installed at `/tmp/gradle-8.7/` and is NOT on PATH. Always invoke it as `/tmp/gradle-8.7/bin/gradle`.
+
 ```bash
 bash scripts/build_bpf.sh
 bash scripts/build_loader.sh

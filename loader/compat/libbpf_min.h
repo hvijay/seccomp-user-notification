@@ -1,6 +1,7 @@
 #ifndef SECCOMP_BINDER_MONITOR_LIBBPF_MIN_H_
 #define SECCOMP_BINDER_MONITOR_LIBBPF_MIN_H_
 
+#include <stdbool.h>
 #include <stdarg.h>
 
 struct bpf_link;
@@ -32,6 +33,9 @@ int bpf_object__find_map_fd_by_name(const struct bpf_object* obj, const char* na
 struct bpf_link* bpf_program__attach_tracepoint(const struct bpf_program* prog,
                                                 const char* tp_category,
                                                 const char* tp_name);
+struct bpf_link* bpf_program__attach_kprobe(const struct bpf_program* prog,
+                                            bool retprobe,
+                                            const char* func_name);
 int bpf_link__pin(struct bpf_link* link, const char* path);
 int bpf_link__destroy(struct bpf_link* link);
 

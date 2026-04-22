@@ -172,6 +172,8 @@ static uint32_t ParcelWriteStr16(uint8_t* buf, uint32_t off, const char* s) {
         buf[off + i * 2 + 1] = 0;
     }
     off += len * 2;
+    buf[off++] = 0;  /* UTF-16 null terminator low byte */
+    buf[off++] = 0;  /* UTF-16 null terminator high byte */
     while (off % 4 != 0) buf[off++] = 0;
     return off;
 }
@@ -228,20 +230,31 @@ static uint32_t ParcelWriteStr16(uint8_t* buf, uint32_t off, const char* s) {
     uint32_t max_threads = 0;
     ioctl(bfd, BINDER_SET_MAX_THREADS, &max_threads);
 
-    /* Build the fake Parcel (eBPF parse layout). */
+    /* Build an IContentProvider.query() Parcel for content://com.android.calendar/events.
+     *
+     * Header:  strict_mode(u32) | work_source_uid(u32) | interface(str16)
+     * Params:  callingPkg(str16) | callingFeatureId(null str16, API 30+)
+     *        | Uri: int32(3=HierarchicalUri) | scheme(str16)
+     *               | authority Part: int32(1=ENCODED) str16
+     *               | path Part:      int32(1=ENCODED) str16
+     *               | query Part:     int32(-1=null)
+     *               | fragment Part:  int32(-1=null)
+     */
     uint8_t parcel[1024] = {};
     uint32_t poff = 0;
     poff = ParcelWriteU32(parcel, poff, 0);        /* strict_mode */
     poff = ParcelWriteU32(parcel, poff, ~0u);       /* work_source_uid */
-    poff = ParcelWriteStr16(parcel, poff, "android.app.IActivityTaskManager");
-    poff = ParcelWriteStr16(parcel, poff, args.action.c_str());
-    poff = ParcelWriteStr16(parcel, poff, args.data_uri.c_str());
-    poff = ParcelWriteStr16(parcel, poff, nullptr); /* package_name */
+    poff = ParcelWriteStr16(parcel, poff, "android.content.IContentProvider");
+    poff = ParcelWriteStr16(parcel, poff, "com.example.seccomp.demoapp"); /* callingPkg */
+    poff = ParcelWriteU32(parcel, poff, static_cast<uint32_t>(-1));       /* callingFeatureId null */
+    /* Uri: StringUri (type=1) — single UTF-16 string, unambiguous for Parcel readers. */
+    poff = ParcelWriteU32(parcel, poff, 1);
+    poff = ParcelWriteStr16(parcel, poff, "content://com.android.calendar/events");
 
     /* binder_transaction_data: TF_ONE_WAY so no reply is expected. */
     struct binder_transaction_data txn = {};
     txn.target.handle         = 1;   /* any registered service handle */
-    txn.code                  = 1;   /* TRANSACTION_startActivity */
+    txn.code                  = 1;   /* TRANSACTION_query */
     txn.flags                 = TF_ONE_WAY;
     txn.data_size             = poff;
     txn.data.ptr.buffer       = reinterpret_cast<binder_uintptr_t>(parcel);
@@ -265,12 +278,13 @@ static uint32_t ParcelWriteStr16(uint8_t* buf, uint32_t off, const char* s) {
 
     /*
      * This ioctl(BINDER_WRITE_READ) is intercepted by seccomp → frozen until
-     * the policydaemon responds.  eBPF fires on sys_enter before the freeze.
+     * the policydaemon responds.  The Binder metadata capture now runs from
+     * the seccomp path before the task is parked for USER_NOTIF handling.
      */
     int rc = ioctl(bfd, BINDER_WRITE_READ, &bwr);
 
-    static const char kAllowed[] = "Binder VIEW transaction submitted (seccomp allowed).\n";
-    static const char kDenied[]  = "Binder VIEW transaction denied by policy.\n";
+    static const char kAllowed[] = "Calendar query ioctl submitted (seccomp allowed).\n";
+    static const char kDenied[]  = "Calendar query ioctl denied by policy.\n";
     const char* msg = (rc == 0 || errno != EPERM) ? kAllowed : kDenied;
     TEMP_FAILURE_RETRY(write(STDOUT_FILENO, msg, strlen(msg)));
     close(bfd);

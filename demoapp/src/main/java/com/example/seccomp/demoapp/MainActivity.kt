@@ -1,15 +1,19 @@
 package com.example.seccomp.demoapp
 
+import android.Manifest
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
-import android.net.Uri
+import android.content.pm.PackageManager
 import android.os.Bundle
 import android.os.IBinder
 import android.os.ParcelFileDescriptor
+import android.provider.CalendarContract
 import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import com.example.seccomp.demoapp.databinding.ActivityMainBinding
 import com.example.seccomp.shared.ISeccompPolicyDaemon
@@ -17,6 +21,8 @@ import com.example.seccomp.shared.ServiceContract
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.text.DateFormat
+import java.util.Date
 
 class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
@@ -25,6 +31,16 @@ class MainActivity : AppCompatActivity() {
     private var lastResultMessage: String? = null
     private var demoInFlight = false
     private var pendingIntentRun = false
+
+    private val calendarPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        if (granted) {
+            loadAndDisplayCalendarEvents()
+        } else {
+            binding.eventsText.text = "READ_CALENDAR permission denied — cannot display events."
+        }
+    }
 
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
@@ -81,6 +97,7 @@ class MainActivity : AppCompatActivity() {
     override fun onStart() {
         super.onStart()
         bindToDaemon()
+        requestCalendarPermissionOrLoad()
     }
 
     override fun onStop() {
@@ -91,6 +108,54 @@ class MainActivity : AppCompatActivity() {
         }
         daemon = null
         binding.startDemoButton.isEnabled = false
+    }
+
+    private fun requestCalendarPermissionOrLoad() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_CALENDAR)
+            == PackageManager.PERMISSION_GRANTED
+        ) {
+            loadAndDisplayCalendarEvents()
+        } else {
+            calendarPermissionLauncher.launch(Manifest.permission.READ_CALENDAR)
+        }
+    }
+
+    private fun loadAndDisplayCalendarEvents() {
+        lifecycleScope.launch {
+            val events = withContext(Dispatchers.IO) { queryCalendarEvents() }
+            binding.eventsText.text = if (events.isEmpty()) {
+                "No upcoming events found."
+            } else {
+                events.joinToString("\n")
+            }
+        }
+    }
+
+    private fun queryCalendarEvents(): List<String> {
+        val projection = arrayOf(
+            CalendarContract.Events.TITLE,
+            CalendarContract.Events.DTSTART,
+        )
+        val now = System.currentTimeMillis()
+        val cursor = contentResolver.query(
+            CalendarContract.Events.CONTENT_URI,
+            projection,
+            "${CalendarContract.Events.DTSTART} >= ?",
+            arrayOf(now.toString()),
+            "${CalendarContract.Events.DTSTART} ASC",
+        ) ?: return emptyList()
+        return cursor.use { c ->
+            val fmt = DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT)
+            buildList {
+                val titleIdx = c.getColumnIndexOrThrow(CalendarContract.Events.TITLE)
+                val startIdx = c.getColumnIndexOrThrow(CalendarContract.Events.DTSTART)
+                while (c.moveToNext() && size < 10) {
+                    val title = c.getString(titleIdx) ?: "(no title)"
+                    val start = fmt.format(Date(c.getLong(startIdx)))
+                    add("• $title  ($start)")
+                }
+            }
+        }
     }
 
     private fun bindToDaemon() {
@@ -136,15 +201,15 @@ class MainActivity : AppCompatActivity() {
         demoInFlight = true
         lastResultMessage = null
         binding.startDemoButton.isEnabled = false
-        updateStatus("Installing Binder ioctl filter, forking child, and issuing a native VIEW intent...")
+        updateStatus("Installing Binder ioctl filter, forking child, and issuing a raw IContentProvider.query() for the calendar…")
 
         lifecycleScope.launch {
             val result = withContext(Dispatchers.IO) {
                 NativeSeccompBridge.installFilterForkAndTriggerIntent(
-                    ServiceContract.DEMO_NATIVE_ACTION,
+                    "query",
                     "",
                     "",
-                    ServiceContract.DEMO_NATIVE_URI,
+                    "content://com.android.calendar/events",
                 )
             }
 
@@ -167,14 +232,14 @@ class MainActivity : AppCompatActivity() {
             }
 
             val sessionId = "session-${System.currentTimeMillis()}"
-            val myPid = android.os.Process.myPid()
             val description =
-                "Intercept ioctl(BINDER_WRITE_READ) from forked child pid=$childPid while it opens ${ServiceContract.DEMO_NATIVE_URI}."
+                "Intercept ioctl(BINDER_WRITE_READ) from forked child pid=$childPid " +
+                "querying content://com.android.calendar/events."
 
             val localListenerFd = ParcelFileDescriptor.adoptFd(listenerFd).detachFd()
             val registered = runCatching {
                 ParcelFileDescriptor.fromFd(localListenerFd).use { pfd ->
-                    currentDaemon.registerSession(sessionId, pfd, description, myPid)
+                    currentDaemon.registerSession(sessionId, pfd, description, childPid)
                 }
             }.getOrElse { error ->
                 updateStatus("Failed to send listener FD to daemon: ${error.message}")
@@ -183,15 +248,12 @@ class MainActivity : AppCompatActivity() {
 
             updateStatus(
                 if (registered) {
-                    "Listener transferred to loader daemon. Review Binder ioctl request in policy daemon app for child pid=$childPid (cgroup from myPid=$myPid)."
+                    "Listener transferred to loader daemon. Review calendar query request in policy daemon app for child pid=$childPid."
                 } else {
                     "Daemon rejected the listener registration."
                 },
             )
 
-            /* registerSession is synchronous: by the time it returns, nativeStartListener
-               has already sent SET_TARGET to the loader and the BPF cgroup filter is armed.
-               Signal the child now so its ioctl(BINDER_WRITE_READ) is captured by eBPF. */
             if (goWriteFd >= 0) {
                 NativeSeccompBridge.triggerChild(goWriteFd)
             }
@@ -205,9 +267,6 @@ class MainActivity : AppCompatActivity() {
                     runCatching { currentDaemon.unregisterSession(sessionId) }
                     demoInFlight = false
                     lastResultMessage = outcome
-                    if (outcome.contains("seccomp allowed")) {
-                        launchVisibleDemoIntent()
-                    }
                     updateStatus(outcome)
                     binding.startDemoButton.isEnabled = bound
                 }
@@ -216,7 +275,6 @@ class MainActivity : AppCompatActivity() {
                 NativeSeccompBridge.closeFd(localListenerFd)
             }
             if (!registered) {
-                /* Unblock and discard the child — nobody is listening. */
                 if (goWriteFd >= 0) NativeSeccompBridge.triggerChild(goWriteFd)
                 binding.startDemoButton.isEnabled = true
             }
@@ -226,16 +284,6 @@ class MainActivity : AppCompatActivity() {
     private fun updateStatus(message: String) {
         DebugStateStore.updateStatus(message)
         binding.statusText.text = message
-    }
-
-    private fun launchVisibleDemoIntent() {
-        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(ServiceContract.DEMO_NATIVE_URI)).apply {
-            addCategory(Intent.CATEGORY_BROWSABLE)
-        }
-        runCatching { startActivity(intent) }
-            .onFailure { error ->
-                showToast("Allowed, but browser launch failed: ${error.message}")
-            }
     }
 
     private fun showToast(message: String) {

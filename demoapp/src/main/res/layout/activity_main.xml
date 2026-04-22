@@ -12,8 +12,25 @@
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="This app installs a seccomp user-notify filter for ioctl(BINDER_WRITE_READ), forks a child, and has native code open a URL (android.intent.action.VIEW) so the policy daemon can inspect and allow or deny the Binder transaction."
+            android:text="Installs a seccomp user-notify filter for ioctl(BINDER_WRITE_READ), forks a child, and has the child issue a raw IContentProvider.query() to content://com.android.calendar/events so the policy daemon can inspect and allow or deny the Binder transaction."
             android:textAppearance="?attr/textAppearanceBodyLarge" />
+
+        <TextView
+            android:id="@+id/eventsLabel"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="20dp"
+            android:text="Upcoming events (content://com.android.calendar/events):"
+            android:textAppearance="?attr/textAppearanceLabelMedium" />
+
+        <TextView
+            android:id="@+id/eventsText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:fontFamily="monospace"
+            android:text="Loading…"
+            android:textAppearance="?attr/textAppearanceBodySmall" />
 
         <Button
             android:id="@+id/openDaemonButton"
@@ -35,7 +52,7 @@
             android:layout_height="wrap_content"
             android:layout_marginTop="12dp"
             android:enabled="false"
-            android:text="Install filter + fork native Binder child" />
+            android:text="Intercept calendar query (install filter + fork)" />
 
         <TextView
             android:id="@+id/statusText"

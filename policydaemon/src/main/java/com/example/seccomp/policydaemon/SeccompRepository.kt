@@ -112,11 +112,37 @@ object SeccompRepository {
         val refreshed = linkedMapOf<String, PendingRequest>()
         sessionDescriptions.forEach { (sessionId, description) ->
             val targetPid = sessionTargetPids[sessionId] ?: -1
-            val parsed = SeccompNativeBridge.nativeGetPendingRequest(sessionId) ?: return@forEach
-            val notificationId = parsed.getOrNull(0)?.toLongOrNull() ?: return@forEach
-            val pid = parsed.getOrNull(1)?.toIntOrNull() ?: return@forEach
-            val syscallNr = parsed.getOrNull(2)?.toIntOrNull() ?: return@forEach
-            val ioctlCmd = parsed.getOrNull(3)?.toLongOrNull() ?: return@forEach
+            val raw = SeccompNativeBridge.nativeGetPendingRequest(sessionId) ?: return@forEach
+
+            // Indices 0-6 are String transport metadata; 7 is byte[] parcel; 8 is String byte count.
+            fun strOrNull(idx: Int): String? = raw.getOrNull(idx) as? String
+
+            // notification_id is uint64; parse via ULong to avoid overflow on high-bit values.
+            val notificationId = strOrNull(0)?.toULongOrNull()?.toLong() ?: return@forEach
+            val pid = strOrNull(1)?.toIntOrNull() ?: return@forEach
+            val syscallNr = strOrNull(2)?.toIntOrNull() ?: return@forEach
+            val ioctlCmd = strOrNull(3)?.toLongOrNull() ?: return@forEach
+            val binderCode = strOrNull(4)?.toIntOrNull() ?: 0
+            val targetHandle = strOrNull(5)?.toIntOrNull() ?: 0
+            val parcelTruncated = strOrNull(6)?.toBooleanStrictOrNull() ?: false
+            val parcelBytes = raw.getOrNull(7) as? ByteArray
+            val capturedBytes = strOrNull(8)?.toIntOrNull() ?: 0
+
+            // Decode exclusively in policydaemon with android.os.Parcel.
+            val parsedCall = parcelBytes?.let {
+                BinderParcelDecoder.decode(
+                    rawParcel = it,
+                    capturedBytes = capturedBytes,
+                    txnCode = binderCode,
+                    truncated = parcelTruncated,
+                )
+            }
+            val parsedIntent = parsedCall?.args
+                ?.filterIsInstance<BinderArg.IntentValue>()
+                ?.firstOrNull()?.intent
+            val parsedUri = parsedCall?.args
+                ?.filterIsInstance<BinderArg.UriValue>()
+                ?.firstOrNull()?.value
             val key = "$sessionId:$notificationId"
             refreshed[key] = PendingRequest(
                 sessionId = sessionId,
@@ -128,12 +154,13 @@ object SeccompRepository {
                 targetPid = targetPid,
                 cgroupPath = "",
                 monitorStatus = "seccomp user-notify",
-                binderInterface = parsed.getOrNull(4).orEmpty(),
-                binderCode = parsed.getOrNull(5)?.toIntOrNull() ?: 0,
-                targetHandle = parsed.getOrNull(6)?.toIntOrNull() ?: 0,
-                intentAction = parsed.getOrNull(7).orEmpty(),
-                intentUri = parsed.getOrNull(8).orEmpty(),
-                parcelTruncated = parsed.getOrNull(9)?.toBooleanStrictOrNull() ?: false,
+                binderInterface = parsedCall?.interfaceDescriptor.orEmpty(),
+                binderCode = binderCode,
+                targetHandle = targetHandle,
+                intentAction = parsedIntent?.action.orEmpty(),
+                intentUri = (parsedIntent?.data ?: parsedUri)?.toString().orEmpty(),
+                parcelTruncated = parcelTruncated,
+                parsedCall = parsedCall,
             )
         }
         if (refreshed != pendingRequests) {

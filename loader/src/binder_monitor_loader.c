@@ -18,15 +18,24 @@
 #include <sys/un.h>
 #include <stdint.h>
 #include <pthread.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 #include "../compat/libbpf_min.h"
+#include "../compat/binder_uapi_min.h"
 #include "shared_types.h"
+
+/* Strip ARM64 MTE tag bits before passing a user pointer to process_vm_readv. */
+static inline uintptr_t untag_uptr(uint64_t ptr)
+{
+    return (uintptr_t)(ptr & 0x00FFFFFFFFFFFFFFULL);
+}
 
 #define DEFAULT_BPF_OBJ "/data/local/tmp/binder_monitor.bpf.o"
 #define DEFAULT_PIN_DIR "/sys/fs/bpf/binder_monitor"
 #define DEFAULT_LINK_PATH DEFAULT_PIN_DIR "/link"
 #define DEFAULT_TXN_MAP_PATH DEFAULT_PIN_DIR "/txn_map"
+#define DEFAULT_DEBUG_COUNTERS_PATH DEFAULT_PIN_DIR "/debug_counters"
 #define DEFAULT_PROXY_SOCKET_PATH "@binder_monitor_proxy"
 
 struct options {
@@ -349,6 +358,64 @@ static int recv_fd_with_status(int sock_fd, int* out_fd)
     return status;
 }
 
+static void enrich_from_process_vm(struct binder_txn_info* txn,
+                                   const struct seccomp_notif* notif)
+{
+    if ((uint32_t)notif->data.args[1] != (uint32_t)BINDER_WRITE_READ)
+        return;
+
+    struct binder_write_read bwr = {};
+    struct iovec lv1 = { &bwr, sizeof(bwr) };
+    struct iovec rv1 = { (void *)untag_uptr(notif->data.args[2]), sizeof(bwr) };
+    if (process_vm_readv((pid_t)notif->pid, &lv1, 1, &rv1, 1, 0) != (ssize_t)sizeof(bwr)) {
+        fprintf(stderr, "proxy: process_vm_readv bwr failed pid=%u: %s\n",
+                notif->pid, strerror(errno));
+        return;
+    }
+
+    if (bwr.write_size < sizeof(uint32_t) + sizeof(struct binder_transaction_data))
+        return;
+
+    uint32_t bcmd = 0;
+    struct iovec lv2 = { &bcmd, sizeof(bcmd) };
+    struct iovec rv2 = { (void *)untag_uptr(bwr.write_buffer), sizeof(bcmd) };
+    if (process_vm_readv((pid_t)notif->pid, &lv2, 1, &rv2, 1, 0) != (ssize_t)sizeof(bcmd))
+        return;
+
+    if (bcmd != (uint32_t)BC_TRANSACTION && bcmd != (uint32_t)BC_REPLY)
+        return;
+
+    struct binder_transaction_data txn_data = {};
+    struct iovec lv3 = { &txn_data, sizeof(txn_data) };
+    struct iovec rv3 = { (void *)(untag_uptr(bwr.write_buffer) + sizeof(bcmd)), sizeof(txn_data) };
+    if (process_vm_readv((pid_t)notif->pid, &lv3, 1, &rv3, 1, 0) != (ssize_t)sizeof(txn_data))
+        return;
+
+    txn->target_handle = txn_data.target.handle;
+    txn->code          = txn_data.code;
+    txn->flags         = txn_data.flags;
+    txn->data_size     = (uint32_t)txn_data.data_size;
+    txn->offsets_size  = (uint32_t)txn_data.offsets_size;
+    txn->is_reply      = (bcmd == (uint32_t)BC_REPLY) ? 1 : 0;
+    txn->parcel_truncated = txn_data.data_size > PARCEL_CAPTURE_SIZE ? 1 : 0;
+
+    uint32_t capture = (uint32_t)txn_data.data_size;
+    if (capture > PARCEL_CAPTURE_SIZE)
+        capture = PARCEL_CAPTURE_SIZE;
+
+    if (capture > 0 && txn_data.data.ptr.buffer != 0) {
+        struct iovec lv4 = { txn->raw_parcel, capture };
+        struct iovec rv4 = { (void *)untag_uptr(txn_data.data.ptr.buffer), capture };
+        if (process_vm_readv((pid_t)notif->pid, &lv4, 1, &rv4, 1, 0) == (ssize_t)capture) {
+            txn->parcel_captured = capture;
+            fprintf(stdout, "proxy: process_vm_readv parcel ok pid=%u code=%u handle=%u"
+                    " data_size=%u captured=%u\n",
+                    notif->pid, txn->code, txn->target_handle,
+                    txn->data_size, capture);
+        }
+    }
+}
+
 static void fill_pending_request(struct proxy_pending_request* pending,
                                  const struct seccomp_notif* notif,
                                  int txn_map_fd)
@@ -365,6 +432,10 @@ static void fill_pending_request(struct proxy_pending_request* pending,
         fprintf(stderr, "proxy: lookup tid=%u failed: %s\n",
                 pending->pid, strerror(errno));
     }
+
+    /* Fall back to process_vm_readv when the BPF side did not capture the raw parcel. */
+    if (pending->txn.parcel_captured == 0)
+        enrich_from_process_vm(&pending->txn, notif);
 }
 
 static void* active_session_thread(void* opaque)
@@ -409,12 +480,12 @@ static void* active_session_thread(void* opaque)
         session->current_notif = notif;
         fill_pending_request(&session->pending, &notif, session->txn_map_fd);
         fprintf(stdout,
-                "proxy: pending notification id=%llu tid=%u iface='%s' action='%s' uri='%s'\n",
+                "proxy: pending notification id=%llu tid=%u code=%u handle=%u captured=%u\n",
                 (unsigned long long)session->pending.notification_id,
                 session->pending.pid,
-                session->pending.txn.interface,
-                session->pending.txn.intent.action,
-                session->pending.txn.intent.uri);
+                session->pending.txn.code,
+                session->pending.txn.target_handle,
+                session->pending.txn.parcel_captured);
         fflush(stdout);
         session->has_pending = true;
         session->decision_ready = false;
@@ -526,10 +597,10 @@ static int start_active_session(struct active_session* session, int listener_fd,
 
 static int update_target_map_for_pid(int target_map_fd, uint32_t pid)
 {
-    uint64_t cgroup_id = 0;
+    uint64_t target_pid = 0;
     uint32_t zero = 0;
     if (pid == 0) {
-        if (sys_bpf_map_update_elem(target_map_fd, &zero, &cgroup_id, 0) != 0) {
+        if (sys_bpf_map_update_elem(target_map_fd, &zero, &target_pid, 0) != 0) {
             fprintf(stderr, "proxy: SET_TARGET clear failed: %s\n", strerror(errno));
             return -1;
         }
@@ -538,23 +609,13 @@ static int update_target_map_for_pid(int target_map_fd, uint32_t pid)
         return 0;
     }
 
-    char cgroup_path[PATH_MAX];
-    struct stat st;
-    if (read_cgroup_path_for_pid((pid_t)pid, cgroup_path, sizeof(cgroup_path)) != 0 ||
-        stat(cgroup_path, &st) != 0) {
-        fprintf(stderr, "proxy: SET_TARGET pid=%u cgroup resolve failed: %s\n",
-                pid, strerror(errno));
+    target_pid = pid;
+    if (sys_bpf_map_update_elem(target_map_fd, &zero, &target_pid, 0) != 0) {
+        fprintf(stderr, "proxy: SET_TARGET pid map update failed: %s\n", strerror(errno));
         return -1;
     }
 
-    cgroup_id = (uint64_t)st.st_ino;
-    if (sys_bpf_map_update_elem(target_map_fd, &zero, &cgroup_id, 0) != 0) {
-        fprintf(stderr, "proxy: SET_TARGET map update failed: %s\n", strerror(errno));
-        return -1;
-    }
-
-    fprintf(stdout, "proxy: monitoring pid=%u cgroup=%s id=%llu\n",
-            pid, cgroup_path, (unsigned long long)cgroup_id);
+    fprintf(stdout, "proxy: monitoring pid=%u\n", pid);
     fflush(stdout);
     return 0;
 }
@@ -695,7 +756,9 @@ static void* handle_proxy_client_thread(void* opaque)
 static int unload_pins(const struct options* options)
 {
     char target_map_path[PATH_MAX];
+    char debug_counters_path[PATH_MAX];
     snprintf(target_map_path, sizeof(target_map_path), "%s/target_cgroup_map", options->pin_dir);
+    snprintf(debug_counters_path, sizeof(debug_counters_path), "%s/debug_counters", options->pin_dir);
 
     int status = 0;
 
@@ -714,6 +777,11 @@ static int unload_pins(const struct options* options)
                 target_map_path, strerror(errno));
         status = 1;
     }
+    if (unlink_if_exists(debug_counters_path) != 0) {
+        fprintf(stderr, "failed to remove pinned map %s: %s\n",
+                debug_counters_path, strerror(errno));
+        status = 1;
+    }
     if (rmdir(options->pin_dir) != 0 && errno != ENOENT && errno != ENOTEMPTY) {
         fprintf(stderr, "failed to remove pin dir %s: %s\n",
                 options->pin_dir, strerror(errno));
@@ -724,32 +792,20 @@ static int unload_pins(const struct options* options)
 
 static int do_load(const struct options* options)
 {
-    char cgroup_path[PATH_MAX];
-    struct stat cgroup_stat;
     struct bpf_object* obj = NULL;
     struct bpf_program* prog;
     struct bpf_link* link = NULL;
     uint32_t zero = 0;
-    uint64_t target_cgroup_id = 0;
+    uint64_t target_pid = 0;
     int target_map_fd = -1;
     int txn_map_fd = -1;
     int status = 1;
 
     if (options->target_pid > 0) {
-        if (read_cgroup_path_for_pid(options->target_pid, cgroup_path, sizeof(cgroup_path)) != 0) {
-            fprintf(stderr, "failed to resolve cgroup for pid %d: %s\n",
-                    options->target_pid, strerror(errno));
-            goto out;
-        }
-        if (stat(cgroup_path, &cgroup_stat) != 0) {
-            fprintf(stderr, "failed to stat cgroup %s: %s\n", cgroup_path, strerror(errno));
-            goto out;
-        }
-        target_cgroup_id = (uint64_t)cgroup_stat.st_ino;
+        target_pid = (uint64_t)options->target_pid;
     } else {
-        /* daemon mode: start with cgroup_id=0 (disabled); policydaemon will SET_TARGET later */
-        cgroup_path[0] = '\0';
-        target_cgroup_id = 0;
+        /* daemon mode: start with pid=0 (disabled); policydaemon will SET_TARGET later */
+        target_pid = 0;
     }
 
     if (mkdir_p(options->pin_dir) != 0) {
@@ -775,11 +831,19 @@ static int do_load(const struct options* options)
     }
 
     char stale_target_map_path[PATH_MAX];
+    char stale_debug_counters_path[PATH_MAX];
     snprintf(stale_target_map_path, sizeof(stale_target_map_path),
              "%s/target_cgroup_map", options->pin_dir);
     if (unlink_if_exists(stale_target_map_path) != 0) {
         fprintf(stderr, "failed to clear stale map pin %s: %s\n",
                 stale_target_map_path, strerror(errno));
+        goto out;
+    }
+    snprintf(stale_debug_counters_path, sizeof(stale_debug_counters_path),
+             "%s/debug_counters", options->pin_dir);
+    if (unlink_if_exists(stale_debug_counters_path) != 0) {
+        fprintf(stderr, "failed to clear stale map pin %s: %s\n",
+                stale_debug_counters_path, strerror(errno));
         goto out;
     }
 
@@ -801,9 +865,9 @@ static int do_load(const struct options* options)
         fprintf(stderr, "failed to find required map fds in %s\n", options->bpf_obj_path);
         goto out;
     }
-    if (sys_bpf_map_update_elem(target_map_fd, &zero, &target_cgroup_id, 0) != 0) {
-        fprintf(stderr, "failed to set target cgroup id %llu: %s\n",
-                (unsigned long long)target_cgroup_id, strerror(errno));
+    if (sys_bpf_map_update_elem(target_map_fd, &zero, &target_pid, 0) != 0) {
+        fprintf(stderr, "failed to set target pid %llu: %s\n",
+                (unsigned long long)target_pid, strerror(errno));
         goto out;
     }
 
@@ -815,6 +879,20 @@ static int do_load(const struct options* options)
     if (chmod_if_exists(options->txn_map_path, 0666) != 0) {
         fprintf(stderr, "failed to relax txn_map permissions at %s: %s\n",
                 options->txn_map_path, strerror(errno));
+        goto out;
+    }
+
+    char debug_counters_path[PATH_MAX];
+    snprintf(debug_counters_path, sizeof(debug_counters_path),
+             "%s/debug_counters", options->pin_dir);
+    struct bpf_map* debug_counters = bpf_object__find_map_by_name(obj, "debug_counters");
+    if (!debug_counters || bpf_map__pin(debug_counters, debug_counters_path) != 0) {
+        fprintf(stderr, "failed to pin debug_counters at %s\n", debug_counters_path);
+        goto out;
+    }
+    if (chmod_if_exists(debug_counters_path, 0666) != 0) {
+        fprintf(stderr, "failed to relax debug_counters permissions at %s: %s\n",
+                debug_counters_path, strerror(errno));
         goto out;
     }
 
@@ -834,9 +912,9 @@ static int do_load(const struct options* options)
         goto out;
     }
 
-    link = bpf_program__attach_tracepoint(prog, "raw_syscalls", "sys_enter");
+    link = bpf_program__attach_kprobe(prog, false, "do_seccomp");
     if (!link || libbpf_get_error(link)) {
-        fprintf(stderr, "failed to attach binder_monitor to raw_syscalls/sys_enter\n");
+        fprintf(stderr, "failed to attach binder_monitor to kprobe/do_seccomp\n");
         link = NULL;
         goto out;
     }
@@ -847,13 +925,11 @@ static int do_load(const struct options* options)
 
     if (options->target_pid > 0) {
         fprintf(stdout,
-                "loaded %s for pid=%d cgroup=%s cgroup_id=%llu\n"
+                "loaded %s for pid=%d\n"
                 "pinned link=%s\n"
                 "pinned txn_map=%s\n",
                 options->bpf_obj_path,
                 options->target_pid,
-                cgroup_path,
-                (unsigned long long)target_cgroup_id,
                 options->link_path,
                 options->txn_map_path);
     } else {
@@ -875,9 +951,13 @@ out:
         unlink_if_exists(options->link_path);
         unlink_if_exists(options->txn_map_path);
         char cleanup_target_path[PATH_MAX];
+        char cleanup_debug_counters_path[PATH_MAX];
         snprintf(cleanup_target_path, sizeof(cleanup_target_path),
                  "%s/target_cgroup_map", options->pin_dir);
         unlink_if_exists(cleanup_target_path);
+        snprintf(cleanup_debug_counters_path, sizeof(cleanup_debug_counters_path),
+                 "%s/debug_counters", options->pin_dir);
+        unlink_if_exists(cleanup_debug_counters_path);
     }
     if (obj) {
         bpf_object__close(obj);

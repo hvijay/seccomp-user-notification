@@ -16,6 +16,7 @@ data class PendingRequest(
     val intentAction: String,
     val intentUri: String,
     val parcelTruncated: Boolean,
+    val parsedCall: BinderCallInfo? = null,
 )
 
 data class RepositoryState(

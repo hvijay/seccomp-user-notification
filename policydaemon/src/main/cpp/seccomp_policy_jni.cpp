@@ -161,32 +161,53 @@ static void SendUnregister(int proxy_fd) {
     }
 }
 
+// Returns an Object[9]:
+//   [0..6]  String transport metadata fields from the loader
+//   [7]     byte[] raw parcel bytes captured from the target process
+//   [8]     String count of valid bytes in [7]
+//
+// The Java layer uses android.os.Parcel (libbinder) to decode [7].
 static jobjectArray MakePendingArray(JNIEnv* env, const proxy_pending_request& pending) {
-    jclass string_class = env->FindClass("java/lang/String");
-    if (string_class == nullptr) {
+    jclass object_class = env->FindClass("java/lang/Object");
+    if (object_class == nullptr) {
         return nullptr;
     }
-    jobjectArray result = env->NewObjectArray(10, string_class, nullptr);
+    jobjectArray result = env->NewObjectArray(9, object_class, nullptr);
     if (result == nullptr) {
         return nullptr;
     }
 
-    const std::string notification_id = std::to_string(pending.notification_id);
-    const std::string pid = std::to_string(pending.pid);
-    const std::string syscall_nr = std::to_string(pending.syscall_nr);
-    const std::string ioctl_cmd = std::to_string(pending.ioctl_cmd);
-    const std::string binder_code = std::to_string(pending.txn.code);
-    const std::string target_handle = std::to_string(pending.txn.target_handle);
-    env->SetObjectArrayElement(result, 0, env->NewStringUTF(notification_id.c_str()));
-    env->SetObjectArrayElement(result, 1, env->NewStringUTF(pid.c_str()));
-    env->SetObjectArrayElement(result, 2, env->NewStringUTF(syscall_nr.c_str()));
-    env->SetObjectArrayElement(result, 3, env->NewStringUTF(ioctl_cmd.c_str()));
-    env->SetObjectArrayElement(result, 4, env->NewStringUTF(pending.txn.interface));
-    env->SetObjectArrayElement(result, 5, env->NewStringUTF(binder_code.c_str()));
-    env->SetObjectArrayElement(result, 6, env->NewStringUTF(target_handle.c_str()));
-    env->SetObjectArrayElement(result, 7, env->NewStringUTF(pending.txn.intent.action));
-    env->SetObjectArrayElement(result, 8, env->NewStringUTF(pending.txn.intent.uri));
-    env->SetObjectArrayElement(result, 9, env->NewStringUTF(pending.txn.parcel_truncated ? "true" : "false"));
+    auto setStr = [&](jsize idx, const std::string& s) {
+        jstring js = env->NewStringUTF(s.c_str());
+        if (js) {
+            env->SetObjectArrayElement(result, idx, js);
+            env->DeleteLocalRef(js);
+        }
+    };
+
+    setStr(0, std::to_string(pending.notification_id));
+    setStr(1, std::to_string(pending.pid));
+    setStr(2, std::to_string(pending.syscall_nr));
+    setStr(3, std::to_string(pending.ioctl_cmd));
+    setStr(4, std::to_string(pending.txn.code));
+    setStr(5, std::to_string(pending.txn.target_handle));
+    setStr(6, pending.txn.parcel_truncated ? "true" : "false");
+
+    uint32_t captured = pending.txn.parcel_captured;
+    if (captured > PARCEL_CAPTURE_SIZE) {
+        captured = PARCEL_CAPTURE_SIZE;
+    }
+    if (captured > 0) {
+        jbyteArray parcel_bytes = env->NewByteArray(static_cast<jsize>(captured));
+        if (parcel_bytes != nullptr) {
+            env->SetByteArrayRegion(parcel_bytes, 0, static_cast<jsize>(captured),
+                                    reinterpret_cast<const jbyte*>(pending.txn.raw_parcel));
+            env->SetObjectArrayElement(result, 7, parcel_bytes);
+            env->DeleteLocalRef(parcel_bytes);
+        }
+    }
+    setStr(8, std::to_string(captured));
+
     return result;
 }
 
