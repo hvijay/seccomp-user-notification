@@ -142,11 +142,20 @@
             android:textSize="13sp"
             android:textStyle="bold" />
 
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:text="Demo of Android IPC interception"
+            android:textColor="#6B9FD4"
+            android:textSize="12sp"
+            android:textStyle="italic" />
+
         <Button
             android:id="@+id/calendarActionButton"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="10dp"
+            android:layout_marginTop="6dp"
             android:backgroundTint="#172842"
             android:enabled="false"
             android:text="Print my calendar"
@@ -164,22 +173,20 @@
             android:textAllCaps="false"
             android:textColor="#F4F7FB" />
 
-        <Button
-            android:id="@+id/emailActionButton"
-            android:layout_width="match_parent"
+        <TextView
+            android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_marginTop="8dp"
-            android:backgroundTint="#172842"
-            android:enabled="false"
-            android:text="Send an email"
-            android:textAllCaps="false"
-            android:textColor="#F4F7FB" />
+            android:layout_marginTop="14dp"
+            android:text="Demo of File operation interception"
+            android:textColor="#6B9FD4"
+            android:textSize="12sp"
+            android:textStyle="italic" />
 
         <Button
             android:id="@+id/readContextActionButton"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="8dp"
+            android:layout_marginTop="6dp"
             android:backgroundTint="#172842"
             android:enabled="false"
             android:text="Read workspace file CONTEXT.md"

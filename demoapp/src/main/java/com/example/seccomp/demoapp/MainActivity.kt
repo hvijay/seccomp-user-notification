@@ -94,7 +94,6 @@ class MainActivity : AppCompatActivity() {
 
         binding.calendarActionButton.setOnClickListener { runAgentAction(AgentAction.PRINT_CALENDAR) }
         binding.browserActionButton.setOnClickListener { runAgentAction(AgentAction.OPEN_BROWSER) }
-        binding.emailActionButton.setOnClickListener { runAgentAction(AgentAction.SEND_EMAIL) }
         binding.readContextActionButton.setOnClickListener { runAgentAction(AgentAction.READ_CONTEXT_FILE) }
         binding.execCurlActionButton.setOnClickListener { runAgentAction(AgentAction.EXECUTE_WEB_SEARCH) }
 
@@ -190,7 +189,6 @@ class MainActivity : AppCompatActivity() {
                 when (action) {
                     AgentAction.PRINT_CALENDAR,
                     AgentAction.OPEN_BROWSER,
-                    AgentAction.SEND_EMAIL,
                     -> {
                         val rawParcel = buildParcelForAction(action)
                         NativeSeccompBridge.installFilterForkAndTriggerTransaction(
@@ -306,18 +304,6 @@ class MainActivity : AppCompatActivity() {
                 addAssistantMessage("Opening the browser now.")
             }
 
-            AgentAction.SEND_EMAIL -> {
-                val mailIntent = Intent(Intent.ACTION_SENDTO, Uri.parse("mailto:security-demo@example.com"))
-                    .putExtra(Intent.EXTRA_SUBJECT, "Hello from Atlas")
-                    .putExtra(Intent.EXTRA_TEXT, "This draft was launched after seccomp approval.")
-                runCatching { startActivity(mailIntent) }
-                    .onFailure {
-                        addAssistantMessage("The email request was approved, but no mail app handled it.")
-                        return
-                    }
-                addAssistantMessage("Opening an email draft now.")
-            }
-
             AgentAction.READ_CONTEXT_FILE -> {
                 showResponse("CONTEXT.md", outcome.removePrefix("Child result: ").trim())
                 addAssistantMessage("Here is the current workspace CONTEXT.md.")
@@ -345,12 +331,6 @@ class MainActivity : AppCompatActivity() {
         AgentAction.OPEN_BROWSER -> {
             buildStartActivityParcel(
                 Intent(Intent.ACTION_VIEW, Uri.parse(ServiceContract.DEMO_NATIVE_URI)),
-            )
-        }
-
-        AgentAction.SEND_EMAIL -> {
-            buildStartActivityParcel(
-                Intent(Intent.ACTION_SENDTO, Uri.parse("mailto:security-demo@example.com")),
             )
         }
 
@@ -472,7 +452,6 @@ class MainActivity : AppCompatActivity() {
         val enabled = bound && !demoInFlight
         binding.calendarActionButton.isEnabled = enabled
         binding.browserActionButton.isEnabled = enabled
-        binding.emailActionButton.isEnabled = enabled
         binding.readContextActionButton.isEnabled = enabled
         binding.execCurlActionButton.isEnabled = enabled
     }
@@ -579,10 +558,6 @@ class MainActivity : AppCompatActivity() {
             prompt = "Open the browser",
             outcomeLabel = "Browser launch",
         ),
-        SEND_EMAIL(
-            prompt = "Send an email",
-            outcomeLabel = "Email compose",
-        ),
         READ_CONTEXT_FILE(
             prompt = "Read workspace file CONTEXT.md",
             outcomeLabel = "Workspace file read",
@@ -601,8 +576,6 @@ class MainActivity : AppCompatActivity() {
                 "Intercept ioctl(BINDER_WRITE_READ) from forked child pid=$childPid querying the Calendar content provider."
             OPEN_BROWSER ->
                 "Intercept ioctl(BINDER_WRITE_READ) from forked child pid=$childPid starting an ACTION_VIEW browser intent."
-            SEND_EMAIL ->
-                "Intercept ioctl(BINDER_WRITE_READ) from forked child pid=$childPid starting an ACTION_SENDTO email intent."
             READ_CONTEXT_FILE ->
                 "Intercept openat() from forked child pid=$childPid reading the app workspace CONTEXT.md file."
             EXECUTE_WEB_SEARCH ->
@@ -612,7 +585,6 @@ class MainActivity : AppCompatActivity() {
         companion object {
             fun fromExtra(value: String?): AgentAction = when (value?.lowercase()) {
                 "calendar" -> PRINT_CALENDAR
-                "email" -> SEND_EMAIL
                 "context" -> READ_CONTEXT_FILE
                 "curl" -> EXECUTE_WEB_SEARCH
                 else -> OPEN_BROWSER
