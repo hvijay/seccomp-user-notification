@@ -161,18 +161,30 @@ static void SendUnregister(int proxy_fd) {
     }
 }
 
-// Returns an Object[9]:
-//   [0..6]  String transport metadata fields from the loader
-//   [7]     byte[] raw parcel bytes captured from the target process
-//   [8]     String count of valid bytes in [7]
+// Returns an Object[15]:
+//   [0]  notification_id
+//   [1]  pid
+//   [2]  syscall_nr
+//   [3]  operation_kind
+//   [4]  ioctl_cmd
+//   [5]  binder_code
+//   [6]  target_handle
+//   [7]  parcel_truncated
+//   [8]  open_flags
+//   [9]  open_mode
+//   [10] file_path
+//   [11] exec argv summary
+//   [12] txn.data_size
+//   [13] byte[] raw parcel bytes captured from the target process
+//   [14] String count of valid bytes in [13]
 //
-// The Java layer uses android.os.Parcel (libbinder) to decode [7].
+// The Java layer uses android.os.Parcel (libbinder) to decode [13].
 static jobjectArray MakePendingArray(JNIEnv* env, const proxy_pending_request& pending) {
     jclass object_class = env->FindClass("java/lang/Object");
     if (object_class == nullptr) {
         return nullptr;
     }
-    jobjectArray result = env->NewObjectArray(9, object_class, nullptr);
+    jobjectArray result = env->NewObjectArray(15, object_class, nullptr);
     if (result == nullptr) {
         return nullptr;
     }
@@ -188,10 +200,16 @@ static jobjectArray MakePendingArray(JNIEnv* env, const proxy_pending_request& p
     setStr(0, std::to_string(pending.notification_id));
     setStr(1, std::to_string(pending.pid));
     setStr(2, std::to_string(pending.syscall_nr));
-    setStr(3, std::to_string(pending.ioctl_cmd));
-    setStr(4, std::to_string(pending.txn.code));
-    setStr(5, std::to_string(pending.txn.target_handle));
-    setStr(6, pending.txn.parcel_truncated ? "true" : "false");
+    setStr(3, std::to_string(pending.operation_kind));
+    setStr(4, std::to_string(pending.ioctl_cmd));
+    setStr(5, std::to_string(pending.txn.code));
+    setStr(6, std::to_string(pending.txn.target_handle));
+    setStr(7, pending.txn.parcel_truncated ? "true" : "false");
+    setStr(8, std::to_string(pending.open_flags));
+    setStr(9, std::to_string(pending.open_mode));
+    setStr(10, pending.file_path);
+    setStr(11, pending.exec_argv);
+    setStr(12, std::to_string(pending.txn.data_size));
 
     uint32_t captured = pending.txn.parcel_captured;
     if (captured > PARCEL_CAPTURE_SIZE) {
@@ -202,11 +220,11 @@ static jobjectArray MakePendingArray(JNIEnv* env, const proxy_pending_request& p
         if (parcel_bytes != nullptr) {
             env->SetByteArrayRegion(parcel_bytes, 0, static_cast<jsize>(captured),
                                     reinterpret_cast<const jbyte*>(pending.txn.raw_parcel));
-            env->SetObjectArrayElement(result, 7, parcel_bytes);
+            env->SetObjectArrayElement(result, 13, parcel_bytes);
             env->DeleteLocalRef(parcel_bytes);
         }
     }
-    setStr(8, std::to_string(captured));
+    setStr(14, std::to_string(captured));
 
     return result;
 }

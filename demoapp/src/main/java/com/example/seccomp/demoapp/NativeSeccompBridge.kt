@@ -11,6 +11,18 @@ object NativeSeccompBridge {
         outcomeLabel: String,
     ): IntArray
 
+    external fun installFilterForkAndReadFile(
+        filePath: String,
+        openFlags: Int,
+        outcomeLabel: String,
+    ): IntArray
+
+    external fun installFilterForkAndExec(
+        executablePath: String,
+        argv: Array<String>,
+        outcomeLabel: String,
+    ): IntArray
+
     external fun readChildResult(readFd: Int): String
 
     external fun triggerChild(goWriteFd: Int)

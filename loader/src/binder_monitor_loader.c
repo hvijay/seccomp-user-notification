@@ -416,6 +416,100 @@ static void enrich_from_process_vm(struct binder_txn_info* txn,
     }
 }
 
+static void enrich_open_from_process_vm(struct proxy_pending_request* pending,
+                                        const struct seccomp_notif* notif)
+{
+    if ((uint32_t)notif->data.nr != __NR_openat) {
+        return;
+    }
+
+    pending->operation_kind = OP_KIND_FILE_OPEN;
+    pending->open_flags = (uint32_t)notif->data.args[2];
+    pending->open_mode = (uint32_t)notif->data.args[3];
+
+    memset(pending->file_path, 0, sizeof(pending->file_path));
+    struct iovec local = { pending->file_path, sizeof(pending->file_path) - 1 };
+    struct iovec remote = { (void *)untag_uptr(notif->data.args[1]), sizeof(pending->file_path) - 1 };
+    ssize_t n = process_vm_readv((pid_t)notif->pid, &local, 1, &remote, 1, 0);
+    if (n < 0) {
+        fprintf(stderr, "proxy: process_vm_readv file path failed pid=%u: %s\n",
+                notif->pid, strerror(errno));
+        pending->file_path[0] = '\0';
+        return;
+    }
+    pending->file_path[sizeof(pending->file_path) - 1] = '\0';
+}
+
+static bool read_remote_cstring(pid_t pid, uint64_t remote_ptr, char* out, size_t out_size)
+{
+    if (out_size == 0) {
+        return false;
+    }
+    memset(out, 0, out_size);
+    if (remote_ptr == 0) {
+        return false;
+    }
+
+    struct iovec local = { out, out_size - 1 };
+    struct iovec remote = { (void*)untag_uptr(remote_ptr), out_size - 1 };
+    ssize_t n = process_vm_readv(pid, &local, 1, &remote, 1, 0);
+    if (n < 0) {
+        return false;
+    }
+    out[out_size - 1] = '\0';
+    return true;
+}
+
+static void enrich_exec_from_process_vm(struct proxy_pending_request* pending,
+                                        const struct seccomp_notif* notif)
+{
+    if ((uint32_t)notif->data.nr != __NR_execve) {
+        return;
+    }
+
+    pending->operation_kind = OP_KIND_EXEC;
+    memset(pending->file_path, 0, sizeof(pending->file_path));
+    memset(pending->exec_argv, 0, sizeof(pending->exec_argv));
+
+    read_remote_cstring((pid_t)notif->pid, notif->data.args[0], pending->file_path,
+                        sizeof(pending->file_path));
+
+    uintptr_t argv_ptr = untag_uptr(notif->data.args[1]);
+    if (argv_ptr == 0) {
+        return;
+    }
+
+    size_t used = 0;
+    for (int i = 0; i < 4; ++i) {
+        uint64_t arg_ptr = 0;
+        struct iovec local = { &arg_ptr, sizeof(arg_ptr) };
+        struct iovec remote = { (void*)(argv_ptr + (i * sizeof(uint64_t))), sizeof(arg_ptr) };
+        if (process_vm_readv((pid_t)notif->pid, &local, 1, &remote, 1, 0) !=
+            (ssize_t)sizeof(arg_ptr)) {
+            break;
+        }
+        if (arg_ptr == 0) {
+            break;
+        }
+
+        char arg[128];
+        if (!read_remote_cstring((pid_t)notif->pid, arg_ptr, arg, sizeof(arg))) {
+            break;
+        }
+
+        int n = snprintf(pending->exec_argv + used,
+                         sizeof(pending->exec_argv) - used,
+                         "%s\"%s\"",
+                         used == 0 ? "" : ", ",
+                         arg);
+        if (n < 0 || (size_t)n >= sizeof(pending->exec_argv) - used) {
+            used = sizeof(pending->exec_argv) - 1;
+            break;
+        }
+        used += (size_t)n;
+    }
+}
+
 static void fill_pending_request(struct proxy_pending_request* pending,
                                  const struct seccomp_notif* notif,
                                  int txn_map_fd)
@@ -425,6 +519,17 @@ static void fill_pending_request(struct proxy_pending_request* pending,
     pending->pid = notif->pid;
     pending->syscall_nr = notif->data.nr;
     pending->ioctl_cmd = notif->data.args[1];
+
+    if ((uint32_t)notif->data.nr == __NR_openat) {
+        enrich_open_from_process_vm(pending, notif);
+        return;
+    }
+    if ((uint32_t)notif->data.nr == __NR_execve) {
+        enrich_exec_from_process_vm(pending, notif);
+        return;
+    }
+
+    pending->operation_kind = OP_KIND_BINDER;
 
     if (txn_map_fd >= 0 &&
         sys_bpf_map_lookup_and_delete_elem(txn_map_fd, &pending->pid, &pending->txn) != 0 &&
@@ -479,13 +584,29 @@ static void* active_session_thread(void* opaque)
         memset(&session->current_notif, 0, sizeof(session->current_notif));
         session->current_notif = notif;
         fill_pending_request(&session->pending, &notif, session->txn_map_fd);
-        fprintf(stdout,
-                "proxy: pending notification id=%llu tid=%u code=%u handle=%u captured=%u\n",
-                (unsigned long long)session->pending.notification_id,
-                session->pending.pid,
-                session->pending.txn.code,
-                session->pending.txn.target_handle,
-                session->pending.txn.parcel_captured);
+        if (session->pending.operation_kind == OP_KIND_FILE_OPEN) {
+            fprintf(stdout,
+                    "proxy: pending file-open id=%llu tid=%u path=%s flags=0x%x\n",
+                    (unsigned long long)session->pending.notification_id,
+                    session->pending.pid,
+                    session->pending.file_path,
+                    session->pending.open_flags);
+        } else if (session->pending.operation_kind == OP_KIND_EXEC) {
+            fprintf(stdout,
+                    "proxy: pending exec id=%llu tid=%u path=%s argv=[%s]\n",
+                    (unsigned long long)session->pending.notification_id,
+                    session->pending.pid,
+                    session->pending.file_path,
+                    session->pending.exec_argv);
+        } else {
+            fprintf(stdout,
+                    "proxy: pending binder id=%llu tid=%u code=%u handle=%u captured=%u\n",
+                    (unsigned long long)session->pending.notification_id,
+                    session->pending.pid,
+                    session->pending.txn.code,
+                    session->pending.txn.target_handle,
+                    session->pending.txn.parcel_captured);
+        }
         fflush(stdout);
         session->has_pending = true;
         session->decision_ready = false;

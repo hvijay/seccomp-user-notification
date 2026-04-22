@@ -40,7 +40,7 @@ class PendingRequestAdapter(
     ) : RecyclerView.ViewHolder(binding.root) {
         fun bind(item: PendingRequest) {
             val call = item.parsedCall
-            binding.titleText.text = callerPackage(call) ?: "Unknown calling APK"
+            binding.titleText.text = item.callingPackage.ifEmpty { "Unknown calling APK" }
             binding.bodyText.text = buildBody(item, call)
             binding.allowButton.setOnClickListener { onAllow(item) }
             binding.denyButton.setOnClickListener { onDeny(item) }
@@ -57,14 +57,28 @@ class PendingRequestAdapter(
             }
         }
 
-        private fun callerPackage(call: BinderCallInfo?): String? {
-            return call?.args
-                ?.filterIsInstance<BinderArg.StringValue>()
-                ?.firstOrNull { it.name == "callingPackage" || it.name == "callingPkg" }
-                ?.value
-        }
-
         private fun describeOperation(item: PendingRequest, call: BinderCallInfo?): String {
+            if (item.operationKind == OP_KIND_FILE_OPEN) {
+                return buildString {
+                    append("open(")
+                    append(item.filePath.ifEmpty { "<unknown>" })
+                    append(", ")
+                    append(describeOpenFlags(item.openFlags))
+                    append(")")
+                }
+            }
+            if (item.operationKind == OP_KIND_EXEC) {
+                return buildString {
+                    append("execve(")
+                    append(item.filePath.ifEmpty { "<unknown>" })
+                    if (item.execArgv.isNotEmpty()) {
+                        append(", [")
+                        append(item.execArgv)
+                        append("]")
+                    }
+                    append(")")
+                }
+            }
             val intent = call?.args?.filterIsInstance<BinderArg.IntentValue>()?.firstOrNull()?.intent
             if (intent != null) {
                 return buildString {
@@ -111,6 +125,12 @@ class PendingRequestAdapter(
         }
 
         private fun describeWarning(item: PendingRequest, call: BinderCallInfo?): String? {
+            if (item.operationKind == OP_KIND_FILE_OPEN) {
+                return fileWarning(item.filePath, item.openFlags)
+            }
+            if (item.operationKind == OP_KIND_EXEC) {
+                return execWarning(item.filePath, item.execArgv)
+            }
             val out = linkedSetOf<String>()
             call?.args?.filterIsInstance<BinderArg.IntentValue>()?.firstOrNull()?.intent?.let {
                 out += intentWarnings(it)
@@ -126,6 +146,46 @@ class PendingRequestAdapter(
                 out += intentWarnings(fallbackIntent)
             }
             return out.firstOrNull()
+        }
+
+        private fun describeOpenFlags(flags: Int): String {
+            val mode = flags and 0x3
+            val modeName = when (mode) {
+                0 -> "O_RDONLY"
+                1 -> "O_WRONLY"
+                2 -> "O_RDWR"
+                else -> "0x${flags.toString(16)}"
+            }
+            val extras = mutableListOf<String>()
+            if (flags and 0x40 != 0) extras += "O_CREAT"
+            if (flags and 0x200 != 0) extras += "O_TRUNC"
+            if (flags and 0x400 != 0) extras += "O_APPEND"
+            return listOf(modeName, *extras.toTypedArray()).joinToString("|")
+        }
+
+        private fun fileWarning(path: String, flags: Int): String {
+            val writable = (flags and 0x3) != 0
+            return when {
+                path.endsWith("/CONTEXT.md") && !writable ->
+                    "This would read the app's workspace file CONTEXT.md."
+                path.endsWith("/CONTEXT.md") && writable ->
+                    "This would modify the app's workspace file CONTEXT.md."
+                writable ->
+                    "This would open a file with write access."
+                else ->
+                    "This would read a file from app storage."
+            }
+        }
+
+        private fun execWarning(path: String, argv: String): String {
+            return when {
+                path.endsWith("/curl") || argv.contains("\"curl\"") ->
+                    "This would execute curl to fetch data from the network."
+                path.endsWith("/sh") || path.endsWith("/toybox") ->
+                    "This would execute a shell or toolbox command inside the app sandbox."
+                else ->
+                    "This would execute another program inside the app sandbox."
+            }
         }
 
         private fun intentWarnings(intent: Intent): List<String> {

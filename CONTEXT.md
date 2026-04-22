@@ -4,236 +4,155 @@
 
 - Repo: `/home/hayawardh/git/seccomp-user-notification`
 - Branch: `master`
-- Current commit: `04a881b` (`Fix loader session cleanup for repeated demo runs`)
-- Worktree status at handoff: `CONTEXT.md` modified, not yet committed
+- Current commit: see `git log -1`
+- Build tool: Gradle at `/tmp/gradle-8.7/bin/gradle` (NOT on PATH)
 
 ## Current architecture
 
-This is now closer to the intended production split:
-
 ```text
 demoapp
-  - installs seccomp user-notify filter
-  - forks child that issues the raw Binder ioctl
+  - AI-agent simulation UI ("Atlas")
+  - installs syscall-specific seccomp user-notify filter per action
+  - forks child that issues the intercepted syscall
   - transfers seccomp listener fd to policydaemon over AIDL
   - waits for child result only
 
 policydaemon
-  - UI/control process only
+  - UI/control process
   - receives listener fd from demoapp
   - forwards listener fd to binder_monitor_loader over Unix socket + SCM_RIGHTS
-  - polls loader for pending requests
-  - shows allow/deny UI
+  - polls loader for pending requests; shows allow/deny UI
+  - parses raw parcel bytes with android.os.Parcel (libbinder) in Java
   - sends decisions back to loader
 
 binder_monitor_loader
   - root daemon
   - loads and owns the eBPF programs/maps
-  - arms target cgroup monitoring
+  - arms target cgroup monitoring (SET_TARGET)
   - owns seccomp RECV/SEND after fd handoff
-  - looks up Binder metadata from txn_map
+  - enriches pending request with syscall-specific metadata via process_vm_readv
   - holds per-session pending seccomp state
 ```
 
+## Intercepted syscalls
+
+Three operation kinds are supported, distinguished by `operation_kind` in `proxy_pending_request`:
+
+| `operation_kind` | Syscall | Loader enrichment | Policydaemon display |
+|---|---|---|---|
+| `OP_KIND_BINDER` (1) | `ioctl(BINDER_WRITE_READ)` | raw parcel bytes via `process_vm_readv` | IContentProvider.query, startActivity, etc. via libbinder |
+| `OP_KIND_FILE_OPEN` (2) | `openat` | `file_path` (from args[1] ptr), `open_flags`/`open_mode` | `open(path, O_RDONLY\|…)` |
+| `OP_KIND_EXEC` (3) | `execve` | `file_path` (from args[0] ptr), `exec_argv` summary (up to 4 args from args[1] ptr-array) | `execve(path, [arg0, arg1, …])` |
+
+## Parsing architecture (important design constraint)
+
+- **BPF**: captures raw parcel bytes + transaction metadata only. No parcel header or intent parsing in BPF.
+- **Loader**: enriches file path / argv for non-Binder syscalls via `process_vm_readv`. For Binder, transports raw parcel bytes only — no C-level parcel parsing.
+- **Policydaemon**: all Binder parcel parsing done exclusively in Java using `android.os.Parcel` (libbinder wrapper). Parsing is AIDL-interface-driven, not demoapp-specific.
+
+This matters for production: the monitored app is treated as a black box. The policydaemon must parse what arrives from the loader, not make assumptions about how the app writes it.
+
 ## What is verified working
 
-### End-to-end seccomp allow flow
+- Seccomp interception of Binder ioctl, openat, and execve
+- `OP_KIND_BINDER`: shows `IContentProvider.query(callingPkg=…, uri=content://com.android.calendar/events)` with calendar-read warning
+- `OP_KIND_FILE_OPEN`: shows `open(path, O_RDONLY)` with semantic file warning
+- `OP_KIND_EXEC`: shows `execve(/system/bin/curl, [curl, https://example.com/])` with curl warning
+- Allow/deny flow end-to-end for all three operation kinds
+- Repeated demo runs without restarting loader
+- Calling-package resolved from AIDL binder UID (`Binder.getCallingUid()`) or ActivityManager fallback
 
-Verified on the attached rooted device with `adb` only:
+## Key implementation details
 
-1. start long-lived `binder_monitor_loader daemon`
-2. start `policydaemon`
-3. run `demoapp`
-4. loader receives seccomp notification for the child Binder ioctl
-5. `policydaemon` shows a pending request
-6. send `allow`
-7. loader sends seccomp response
-8. child completes and `demoapp` launches the visible browser action
-
-Observed loader trace from a good run:
-
-```text
-proxy: monitoring pid=12399 cgroup=/sys/fs/cgroup/apps/uid_10339/pid_12399 id=28388
-proxy: listener registered fd=8
-proxy: worker started listener_fd=8 txn_map_fd=3
-proxy: waiting for seccomp notification fd=8
-proxy: received seccomp notification id=... pid=12473 nr=29 arg1=3224396289
-proxy: pending notification id=... tid=12473 iface='' action='' uri=''
-proxy: sending seccomp response id=... allow=1
-proxy: waiting for seccomp notification fd=8
-proxy: SECCOMP_IOCTL_NOTIF_RECV failed: No such file or directory
-proxy: worker exiting
-proxy: monitoring disabled
-```
-
-`policydaemon` showed:
-
-```text
-Pending Binder request from tid=12473 (target pid=12399). Tap allow or deny.
-```
-
-`demoapp` finished with:
-
-```text
-Binder VIEW transaction submitted (seccomp allowed).
-```
-
-### Repeated demo runs without restarting loader
-
-This was the main verified fix in `04a881b`.
-
-Tested sequence:
-
-1. keep one long-lived loader instance running
-2. run demo once and allow it
-3. force-stop only `demoapp`
-4. run demo again without restarting loader or `policydaemon`
-5. allow again
-
-Result:
-
-- second run successfully created a fresh loader session
-- second run surfaced a fresh pending request in `policydaemon`
-- second run completed successfully after allow
-
-Observed loader trace from second run:
-
-```text
-proxy: monitoring pid=12838 cgroup=/sys/fs/cgroup/apps/uid_10339/pid_12838 id=28444
-proxy: listener registered fd=8
-proxy: worker started listener_fd=8 txn_map_fd=3
-proxy: waiting for seccomp notification fd=8
-proxy: received seccomp notification id=... pid=12939 nr=29 arg1=3224396289
-proxy: pending notification id=... tid=12939 iface='' action='' uri=''
-proxy: sending seccomp response id=... allow=1
-proxy: waiting for seccomp notification fd=8
-proxy: SECCOMP_IOCTL_NOTIF_RECV failed: No such file or directory
-proxy: worker exiting
-proxy: monitoring disabled
-```
-
-So repeated runs now work.
-
-## Main code shape
-
-### Loader
-
-File:
-
-- `loader/src/binder_monitor_loader.c`
-
-Important current behavior:
-
-- each proxy client has its own `struct active_session`
-- no more global singleton session state
-- `REGISTER_LISTENER` starts a per-client worker thread
-- worker thread does:
-  - `SECCOMP_IOCTL_NOTIF_RECV`
-  - lookup-and-delete from `txn_map`
-  - hold pending request
-  - wait for decision
-  - `SECCOMP_IOCTL_NOTIF_SEND`
-- client disconnect / unregister cleans up only that client session
-- `SET_TARGET(0)` disables monitoring on session teardown
-
-### Policydaemon
+### Binder parcel parsing (policydaemon Java)
 
 Files:
+- `policydaemon/…/BinderParcelDecoder.kt` — entry point; unmarshalls raw bytes with `Parcel.unmarshall()`, reads header, dispatches to per-interface parsers
+- `policydaemon/…/BinderCallInfo.kt` — data classes for decoded call + args
+- `policydaemon/…/BinderInterfaceRegistry.kt` — maps (interface, txCode) → method name via reflection; falls back to hardcoded table when hidden-API blocks reflection
 
-- `policydaemon/src/main/java/com/example/seccomp/policydaemon/SeccompRepository.kt`
-- `policydaemon/src/main/java/com/example/seccomp/policydaemon/PolicyDaemonService.kt`
-- `policydaemon/src/main/cpp/seccomp_policy_jni.cpp`
-
-Important current behavior:
-
-- receives listener fd from `demoapp`
-- forwards it to loader using `PROXY_MSG_REGISTER_LISTENER`
-- polls loader with `PROXY_MSG_GET_PENDING`
-- sends decisions with `PROXY_MSG_SEND_DECISION`
-- UI is black/green themed with allow/deny controls
-- repeated runs are now working against one long-lived loader
-
-### Demoapp
-
-File:
-
-- `demoapp/src/main/java/com/example/seccomp/demoapp/MainActivity.kt`
-
-Important current behavior:
-
-- no longer does local seccomp `RECV`/`SEND`
-- creates seccomp listener fd and child
-- registers session with `policydaemon`
-- transfers listener ownership away
-- waits for child result only
-- after allow, launches visible browser `ACTION_VIEW`
-
-## Remaining blocker
-
-### Binder-derived metadata is still mostly blank
-
-The policy flow works, but the user-facing Binder metadata shown in `policydaemon` is not yet trustworthy.
-
-Current observed pending row fields:
-
-```text
-binder_interface=
-binder_code=0
-intent_action=
-intent_uri=
+Header layout (Android 9+):
+```
+[int32]  strict-mode policy
+[int32]  work-source UID       ← only if API >= 28 (Build.VERSION_CODES.P)
+[String16] interface descriptor
+[AIDL params follow…]
 ```
 
-Loader trace also shows:
+Known interfaces and hardcoded transaction codes:
+- `android.content.IContentProvider`: query(1), insert(3), update(6), delete(5), …
+- `android.app.IActivityManager`: startActivity(1), broadcastIntent(14), startService(25), bindService(27)
+- `android.app.IActivityTaskManager`: startActivity(1), startActivityAsUser(2)
 
-```text
-proxy: pending notification id=... tid=... iface='' action='' uri=''
+### Samsung `Uri.CREATOR` bug
+
+On Samsung ROM, `StringUri.readFrom(Parcel)` calls `readString8` (reads raw bytes, null-terminated) instead of `readString16`. UTF-16LE null bytes after each ASCII character truncate the result to the first character (e.g. `"content://..."` → `"c"`).
+
+**Fix** (`BinderParcelDecoder.readUri`): manually read the type int, and for StringUri (type=1) call `p.readString()` directly then `Uri.parse()`. For other types fall through to `Uri.CREATOR.createFromParcel()`.
+
+### MakePendingArray (JNI Object[15])
+
+```
+[0]  notification_id (String)
+[1]  pid (String)
+[2]  syscall_nr (String)
+[3]  operation_kind (String: 1=binder, 2=file_open, 3=exec)
+[4]  ioctl_cmd (String)
+[5]  binder_code (String)
+[6]  target_handle (String)
+[7]  parcel_truncated (String: "true"/"false")
+[8]  open_flags (String)
+[9]  open_mode (String)
+[10] file_path (String)
+[11] exec_argv summary (String)
+[12] txn.data_size (String)
+[13] raw parcel bytes (ByteArray, null if nothing captured)
+[14] captured byte count (String)
 ```
 
-So:
+### Loader enrichment for openat/execve
 
-- seccomp interception works
-- repeated runs work
-- pending allow/deny UI works
-- but `txn_map` enrichment is not reliably producing the expected `VIEW https://example.com/` metadata at decision time
+`fill_pending_request()` routes by `notif->data.nr`:
+- `__NR_openat`: `enrich_open_from_process_vm` — reads path from `args[1]` pointer, flags from `args[2]`, mode from `args[3]`
+- `__NR_execve`: `enrich_exec_from_process_vm` — reads path from `args[0]`, walks argv pointer array at `args[1]` (up to 4 entries, each via `process_vm_readv`)
 
-This is the main remaining technical gap.
+### Calling-package resolution
 
-## Likely next debugging direction
+Priority order in `SeccompRepository`:
+1. `sessionCallerPackages[sessionId]` — set at registration time via `Binder.getCallingUid()` + `packageManager.getPackagesForUid()`
+2. `ActivityManager.runningAppProcesses` lookup by PID
+3. `callingPackage`/`callingPkg` string arg from parsed Binder call
 
-Focus on why `fill_pending_request()` gets an empty `binder_txn_info` for the intercepted child tid.
+### Demoapp demo actions
 
-Relevant code path:
+| Button | Kind | Syscall | Example output |
+|---|---|---|---|
+| Print calendar | Binder | ioctl | IContentProvider.query(…, uri=content://…/events) |
+| Open browser | Binder | ioctl | IActivityManager.startActivity(intent={action=VIEW …}) |
+| Send email | Binder | ioctl | IActivityManager.startActivity(intent={action=SENDTO …}) |
+| Read CONTEXT.md | File open | openat | open(…/files/workspace/CONTEXT.md, O_RDONLY) |
+| Execute curl | Exec | execve | execve(/system/bin/curl, [curl, https://example.com/]) |
 
-1. BPF program writes `txn_map[tid]`
-2. loader worker receives seccomp notif for pid/tid
-3. `fill_pending_request()` does `sys_bpf_map_lookup_and_delete_elem(txn_map_fd, &pending->pid, &pending->txn)`
-4. UI shows whatever came back
+Workspace CONTEXT.md is created by `ensureWorkspaceContextFile()` on first launch at `filesDir/workspace/CONTEXT.md`.
 
-Potential causes to check:
+## Known issues / TODOs
 
-- wrong key being used at lookup time
-- `txn_map` entry not yet present when seccomp notification is received
-- BPF parser not recognizing the current Binder parcel shape
-- `lookup_and_delete` returning zeroed or partial data
-- unrelated Binder traffic for the same process overwriting or racing before lookup
-
-The current loader logging is useful for this and should probably stay until metadata is fixed:
-
-- worker start
-- wait for seccomp
-- received seccomp notif
-- pending notification with parsed iface/action/uri
-- get-pending / send-decision logging
+- BPF `parse_parcel_header` and `parse_known_intent_fields` are still called in `binder_monitor.bpf.c` — these fill `txn->interface` and `txn->intent.*` fields which the policydaemon no longer reads (it parses from raw bytes). They are harmless but add BPF complexity. Should be removed in a future cleanup (requires rebuilding the BPF `.o` file).
+- HierarchicalUri (type=3) and OpaqueUri (type=2) are not manually decoded; `Uri.CREATOR.createFromParcel` is used for those types. May be broken on Samsung for the same reason as StringUri. Not encountered in practice yet.
+- `resolveCallingPackage` via `ActivityManager.runningAppProcesses` may be empty once the process is frozen.
 
 ## Useful commands
 
 ### Build
 
-> **Note:** Gradle is installed at `/tmp/gradle-8.7/` and is NOT on PATH. Always invoke it as `/tmp/gradle-8.7/bin/gradle`.
-
 ```bash
+# BPF (requires clang + Android NDK — see scripts/build_bpf.sh)
 bash scripts/build_bpf.sh
+
+# Loader (static ARM64 binary)
 bash scripts/build_loader.sh
+
+# APKs
 /tmp/gradle-8.7/bin/gradle :demoapp:assembleDebug :policydaemon:assembleDebug
 ```
 
@@ -248,51 +167,23 @@ adb install -r demoapp/build/outputs/apk/debug/demoapp-debug.apk
 adb install -r policydaemon/build/outputs/apk/debug/policydaemon-debug.apk
 ```
 
-### Start loader in foreground for debugging
-
-This was the most reliable way to observe loader state:
+### Run
 
 ```bash
+# Start loader daemon (keep running across demo runs)
 adb shell su root /data/local/tmp/binder_monitor_loader daemon
-```
 
-### Start apps
-
-```bash
-adb shell am start-foreground-service -n com.example.seccomp.policydaemon/.PolicyDaemonService
+# Start apps
+adb shell am start -n com.example.seccomp.policydaemon/.MainActivity
 adb shell am start -n com.example.seccomp.demoapp/.MainActivity -a com.example.seccomp.demoapp.action.RUN_DEMO
 ```
 
-### Allow first pending request
+### Inspect
 
 ```bash
-adb shell am start-foreground-service \
-  -n com.example.seccomp.policydaemon/.PolicyDaemonService \
-  -a com.example.seccomp.policydaemon.action.COMMAND \
-  --es decision allow
-```
-
-### Inspect app debug providers
-
-```bash
-adb shell content query --uri content://com.example.seccomp.demoapp.debug/status
-adb shell content query --uri content://com.example.seccomp.demoapp.debug/events
 adb shell content query --uri content://com.example.seccomp.policydaemon.debug/status
 adb shell content query --uri content://com.example.seccomp.policydaemon.debug/pending
-```
-
-### Inspect BPF txn map
-
-```bash
+adb shell content query --uri content://com.example.seccomp.demoapp.debug/status
+adb logcat -s "BinderParcelDecoder:D" "SeccompRepository:D" "SeccompPolicyJNI:W"
 adb shell su root bpftool map dump pinned /sys/fs/bpf/binder_monitor/txn_map
 ```
-
-## Summary
-
-At this handoff point:
-
-- production-like ownership split is implemented
-- loader owns seccomp receive/respond
-- policydaemon is effectively UI/control
-- repeated runs are fixed and verified
-- remaining blocker is Binder metadata enrichment, not the seccomp/session architecture

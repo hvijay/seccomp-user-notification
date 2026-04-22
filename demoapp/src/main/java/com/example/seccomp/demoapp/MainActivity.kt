@@ -32,6 +32,7 @@ import com.example.seccomp.shared.ServiceContract
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
 import java.text.DateFormat
 import java.util.Date
 
@@ -94,8 +95,11 @@ class MainActivity : AppCompatActivity() {
         binding.calendarActionButton.setOnClickListener { runAgentAction(AgentAction.PRINT_CALENDAR) }
         binding.browserActionButton.setOnClickListener { runAgentAction(AgentAction.OPEN_BROWSER) }
         binding.emailActionButton.setOnClickListener { runAgentAction(AgentAction.SEND_EMAIL) }
+        binding.readContextActionButton.setOnClickListener { runAgentAction(AgentAction.READ_CONTEXT_FILE) }
+        binding.execCurlActionButton.setOnClickListener { runAgentAction(AgentAction.EXECUTE_WEB_SEARCH) }
 
         seedConversation()
+        ensureWorkspaceContextFile()
         handleLaunchIntent(intent)
         updateActionButtons()
     }
@@ -123,8 +127,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun seedConversation() {
-        addAssistantMessage("Atlas is ready. Pick a hardcoded action below and I’ll request it through Binder.")
-        addAssistantMessage("Try: print your calendar, open a browser tab, or draft an email.")
+        addAssistantMessage("Atlas is ready. Pick a hardcoded action below and I’ll request approval before it runs.")
+        addAssistantMessage("Try: print your calendar, open a browser tab, read CONTEXT.md, or run a curl web search.")
     }
 
     private fun ensureCalendarPermission() {
@@ -179,16 +183,40 @@ class MainActivity : AppCompatActivity() {
         lastResultMessage = null
         updateActionButtons()
         DebugStateStore.updateStatus("Requesting ${action.prompt}")
-        addAssistantMessage("Preparing a Binder request for “${action.prompt}” and handing approval to the policy daemon.")
+        addAssistantMessage("Preparing “${action.prompt}” and handing approval to the policy daemon.")
 
         lifecycleScope.launch {
-            val rawParcel = buildParcelForAction(action)
             val result = withContext(Dispatchers.IO) {
-                NativeSeccompBridge.installFilterForkAndTriggerTransaction(
-                    action.transactionCode,
-                    rawParcel,
-                    action.outcomeLabel,
-                )
+                when (action) {
+                    AgentAction.PRINT_CALENDAR,
+                    AgentAction.OPEN_BROWSER,
+                    AgentAction.SEND_EMAIL,
+                    -> {
+                        val rawParcel = buildParcelForAction(action)
+                        NativeSeccompBridge.installFilterForkAndTriggerTransaction(
+                            action.transactionCode,
+                            rawParcel,
+                            action.outcomeLabel,
+                        )
+                    }
+
+                    AgentAction.READ_CONTEXT_FILE -> {
+                        NativeSeccompBridge.installFilterForkAndReadFile(
+                            workspaceContextFile().absolutePath,
+                            android.system.OsConstants.O_RDONLY,
+                            action.outcomeLabel,
+                        )
+                    }
+
+                    AgentAction.EXECUTE_WEB_SEARCH -> {
+                        val command = resolveCurlCommand()
+                        NativeSeccompBridge.installFilterForkAndExec(
+                            command.first,
+                            command.second.toTypedArray(),
+                            action.outcomeLabel,
+                        )
+                    }
+                }
             }
 
             if (result.size < 2) {
@@ -289,6 +317,16 @@ class MainActivity : AppCompatActivity() {
                     }
                 addAssistantMessage("Opening an email draft now.")
             }
+
+            AgentAction.READ_CONTEXT_FILE -> {
+                showResponse("CONTEXT.md", outcome.removePrefix("Child result: ").trim())
+                addAssistantMessage("Here is the current workspace CONTEXT.md.")
+            }
+
+            AgentAction.EXECUTE_WEB_SEARCH -> {
+                showResponse("curl https://example.com/", outcome.removePrefix("Child result: ").trim())
+                addAssistantMessage("The web search tool finished and returned its output.")
+            }
         }
     }
 
@@ -315,6 +353,10 @@ class MainActivity : AppCompatActivity() {
                 Intent(Intent.ACTION_SENDTO, Uri.parse("mailto:security-demo@example.com")),
             )
         }
+
+        AgentAction.READ_CONTEXT_FILE,
+        AgentAction.EXECUTE_WEB_SEARCH,
+        -> ByteArray(0)
     }
 
     private fun buildContentProviderQueryParcel(uri: Uri): ByteArray {
@@ -431,6 +473,34 @@ class MainActivity : AppCompatActivity() {
         binding.calendarActionButton.isEnabled = enabled
         binding.browserActionButton.isEnabled = enabled
         binding.emailActionButton.isEnabled = enabled
+        binding.readContextActionButton.isEnabled = enabled
+        binding.execCurlActionButton.isEnabled = enabled
+    }
+
+    private fun workspaceContextFile(): File =
+        File(File(filesDir, "workspace"), "CONTEXT.md")
+
+    private fun ensureWorkspaceContextFile() {
+        val file = workspaceContextFile()
+        if (file.exists()) return
+        file.parentFile?.mkdirs()
+        file.writeText(
+            """
+            # Demo Workspace Context
+
+            This file is created by the seccomp demo app.
+            It exists so the "Read workspace file CONTEXT.md" action can trigger a real openat() decision.
+            """.trimIndent() + "\n",
+        )
+    }
+
+    private fun resolveCurlCommand(): Pair<String, List<String>> {
+        val directCurl = File("/system/bin/curl")
+        if (directCurl.exists()) {
+            return directCurl.absolutePath to listOf("curl", "https://example.com/")
+        }
+        val toybox = File("/system/bin/toybox")
+        return toybox.absolutePath to listOf("toybox", "curl", "https://example.com/")
     }
 
     private fun addUserMessage(message: String) {
@@ -513,6 +583,14 @@ class MainActivity : AppCompatActivity() {
             prompt = "Send an email",
             outcomeLabel = "Email compose",
         ),
+        READ_CONTEXT_FILE(
+            prompt = "Read workspace file CONTEXT.md",
+            outcomeLabel = "Workspace file read",
+        ),
+        EXECUTE_WEB_SEARCH(
+            prompt = "Execute web search tool (curl)",
+            outcomeLabel = "curl execution",
+        ),
         ;
 
         val transactionCode: Int
@@ -525,12 +603,18 @@ class MainActivity : AppCompatActivity() {
                 "Intercept ioctl(BINDER_WRITE_READ) from forked child pid=$childPid starting an ACTION_VIEW browser intent."
             SEND_EMAIL ->
                 "Intercept ioctl(BINDER_WRITE_READ) from forked child pid=$childPid starting an ACTION_SENDTO email intent."
+            READ_CONTEXT_FILE ->
+                "Intercept openat() from forked child pid=$childPid reading the app workspace CONTEXT.md file."
+            EXECUTE_WEB_SEARCH ->
+                "Intercept execve() from forked child pid=$childPid launching curl for https://example.com/."
         }
 
         companion object {
             fun fromExtra(value: String?): AgentAction = when (value?.lowercase()) {
                 "calendar" -> PRINT_CALENDAR
                 "email" -> SEND_EMAIL
+                "context" -> READ_CONTEXT_FILE
+                "curl" -> EXECUTE_WEB_SEARCH
                 else -> OPEN_BROWSER
             }
         }

@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
+import android.os.Binder
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
@@ -34,7 +35,15 @@ class PolicyDaemonService : Service() {
             targetPid: Int,
         ): Boolean {
             val rawFd = listenerFd.detachFd()
-            return SeccompRepository.registerSession(sessionId, rawFd, description, targetPid)
+            val callingUid = Binder.getCallingUid()
+            val callerPackage = packageManager.getPackagesForUid(callingUid)?.firstOrNull().orEmpty()
+            return SeccompRepository.registerSession(
+                sessionId = sessionId,
+                fd = rawFd,
+                description = description,
+                targetPid = targetPid,
+                callerPackage = callerPackage,
+            )
         }
 
         override fun unregisterSession(sessionId: String) {

@@ -19,6 +19,7 @@
 #include <unistd.h>
 
 #include <array>
+#include <cstdio>
 #include <string>
 #include <vector>
 
@@ -42,19 +43,29 @@ struct WorkerResult {
 };
 
 struct WorkerArgs {
+    enum class OperationKind {
+        kBinder,
+        kReadFile,
+        kExec,
+    };
+
+    OperationKind operation_kind = OperationKind::kBinder;
     uint32_t transaction_code = 0;
     std::vector<uint8_t> raw_parcel;
+    std::string file_path;
+    std::vector<std::string> argv;
+    int open_flags = O_RDONLY;
     std::string outcome_label;
     int go_read_fd = -1;
     WorkerResult* result;
 };
 
-int InstallUserNotifyFilter() {
+int InstallUserNotifyFilter(WorkerArgs::OperationKind operation_kind) {
     constexpr uint32_t kBinderWriteReadLow = static_cast<uint32_t>(BINDER_WRITE_READ);
     constexpr uint32_t kBinderWriteReadHigh = static_cast<uint32_t>(
             static_cast<uint64_t>(BINDER_WRITE_READ) >> 32U);
 
-    sock_filter filter[] = {
+    sock_filter binder_filter[] = {
         BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, arch)),
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, kAuditArch, 0, 7),
         BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, nr)),
@@ -67,8 +78,36 @@ int InstallUserNotifyFilter() {
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
     };
 
+    sock_filter open_filter[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, arch)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, kAuditArch, 0, 3),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_openat, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+
+    sock_filter exec_filter[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, arch)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, kAuditArch, 0, 3),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_execve, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+
+    sock_filter* filter = binder_filter;
+    unsigned short filter_len = static_cast<unsigned short>(sizeof(binder_filter) / sizeof(binder_filter[0]));
+    if (operation_kind == WorkerArgs::OperationKind::kReadFile) {
+        filter = open_filter;
+        filter_len = static_cast<unsigned short>(sizeof(open_filter) / sizeof(open_filter[0]));
+    } else if (operation_kind == WorkerArgs::OperationKind::kExec) {
+        filter = exec_filter;
+        filter_len = static_cast<unsigned short>(sizeof(exec_filter) / sizeof(exec_filter[0]));
+    }
+
     sock_fprog prog = {
-        .len = static_cast<unsigned short>(sizeof(filter) / sizeof(filter[0])),
+        .len = filter_len,
         .filter = filter,
     };
 
@@ -233,6 +272,74 @@ int ReceiveListenerFd(int sock_fd, int* out_status) {
     _exit(0);
 }
 
+[[noreturn]] void DoReadFileOperation(const WorkerArgs& args, int write_fd) {
+    TEMP_FAILURE_RETRY(dup2(write_fd, STDOUT_FILENO));
+    TEMP_FAILURE_RETRY(dup2(write_fd, STDERR_FILENO));
+    if (write_fd != STDOUT_FILENO && write_fd != STDERR_FILENO) close(write_fd);
+
+    if (args.go_read_fd >= 0) {
+        uint8_t dummy = 0;
+        TEMP_FAILURE_RETRY(read(args.go_read_fd, &dummy, 1));
+        close(args.go_read_fd);
+    }
+
+    int fd = static_cast<int>(syscall(__NR_openat, AT_FDCWD, args.file_path.c_str(), args.open_flags, 0));
+    if (fd < 0) {
+        dprintf(STDOUT_FILENO, "%s denied by policy.\n", args.outcome_label.c_str());
+        _exit(0);
+    }
+
+    std::string output;
+    std::array<char, 4096> buffer{};
+    for (;;) {
+        ssize_t n = TEMP_FAILURE_RETRY(read(fd, buffer.data(), buffer.size()));
+        if (n == 0) break;
+        if (n < 0) {
+            dprintf(STDOUT_FILENO, "Failed to read %s. errno=%d\n", args.file_path.c_str(), errno);
+            close(fd);
+            _exit(1);
+        }
+        output.append(buffer.data(), static_cast<size_t>(n));
+    }
+    close(fd);
+    if (output.empty()) {
+        dprintf(STDOUT_FILENO, "(empty file)\n");
+    } else {
+        TEMP_FAILURE_RETRY(write(STDOUT_FILENO, output.data(), output.size()));
+        if (output.back() != '\n') {
+            TEMP_FAILURE_RETRY(write(STDOUT_FILENO, "\n", 1));
+        }
+    }
+    _exit(0);
+}
+
+[[noreturn]] void DoExecOperation(const WorkerArgs& args, int write_fd) {
+    TEMP_FAILURE_RETRY(dup2(write_fd, STDOUT_FILENO));
+    TEMP_FAILURE_RETRY(dup2(write_fd, STDERR_FILENO));
+    if (write_fd != STDOUT_FILENO && write_fd != STDERR_FILENO) close(write_fd);
+
+    if (args.go_read_fd >= 0) {
+        uint8_t dummy = 0;
+        TEMP_FAILURE_RETRY(read(args.go_read_fd, &dummy, 1));
+        close(args.go_read_fd);
+    }
+
+    std::vector<char*> argv;
+    argv.reserve(args.argv.size() + 1);
+    for (const std::string& arg : args.argv) {
+        argv.push_back(const_cast<char*>(arg.c_str()));
+    }
+    argv.push_back(nullptr);
+
+    execv(args.file_path.c_str(), argv.data());
+    dprintf(STDOUT_FILENO,
+            "%s denied by policy or failed. errno=%d (%s)\n",
+            args.outcome_label.c_str(),
+            errno,
+            strerror(errno));
+    _exit(1);
+}
+
 void* WorkerMain(void* opaque) {
     auto* args = static_cast<WorkerArgs*>(opaque);
     auto* result = args->result;
@@ -285,7 +392,7 @@ void* WorkerMain(void* opaque) {
         close(listener_sock[0]);
         close(result_pipe[0]);
         close(go_pipe[1]);
-        const int listener_fd = InstallUserNotifyFilter();
+        const int listener_fd = InstallUserNotifyFilter(args->operation_kind);
         const int status = listener_fd >= 0 ? 0 : listener_fd;
         SendListenerFd(listener_sock[1], listener_fd >= 0 ? listener_fd : -1, status);
         close(listener_sock[1]);
@@ -293,7 +400,13 @@ void* WorkerMain(void* opaque) {
             _exit(1);
         }
         args->go_read_fd = go_pipe[0];
-        DoBinderTransaction(*args, result_pipe[1]);
+        if (args->operation_kind == WorkerArgs::OperationKind::kReadFile) {
+            DoReadFileOperation(*args, result_pipe[1]);
+        } else if (args->operation_kind == WorkerArgs::OperationKind::kExec) {
+            DoExecOperation(*args, result_pipe[1]);
+        } else {
+            DoBinderTransaction(*args, result_pipe[1]);
+        }
     }
 
     close(listener_sock[1]);
@@ -339,9 +452,83 @@ Java_com_example_seccomp_demoapp_NativeSeccompBridge_installFilterForkAndTrigger
 
     WorkerResult result;
     WorkerArgs args{
+        .operation_kind = WorkerArgs::OperationKind::kBinder,
         .transaction_code = static_cast<uint32_t>(transaction_code),
         .raw_parcel = std::move(raw_parcel),
         .outcome_label = CopyJString(env, outcome_label_j, "Binder transaction"),
+        .result = &result,
+    };
+
+    pthread_t thread;
+    const int create_rc = pthread_create(&thread, nullptr, &WorkerMain, &args);
+    if (create_rc != 0) {
+        result.listener_fd = -create_rc;
+        result.child_pid = -1;
+    } else {
+        pthread_join(thread, nullptr);
+    }
+
+    const jint values[4] = {result.listener_fd, result.child_pid, result.result_read_fd, result.go_write_fd};
+    jintArray output = env->NewIntArray(4);
+    if (output == nullptr) {
+        return nullptr;
+    }
+    env->SetIntArrayRegion(output, 0, 4, values);
+    return output;
+}
+
+extern "C" JNIEXPORT jintArray JNICALL
+Java_com_example_seccomp_demoapp_NativeSeccompBridge_installFilterForkAndReadFile(
+        JNIEnv* env, jclass, jstring file_path_j, jint open_flags, jstring outcome_label_j) {
+    WorkerResult result;
+    WorkerArgs args{
+        .operation_kind = WorkerArgs::OperationKind::kReadFile,
+        .file_path = CopyJString(env, file_path_j, ""),
+        .open_flags = static_cast<int>(open_flags),
+        .outcome_label = CopyJString(env, outcome_label_j, "File read"),
+        .result = &result,
+    };
+
+    pthread_t thread;
+    const int create_rc = pthread_create(&thread, nullptr, &WorkerMain, &args);
+    if (create_rc != 0) {
+        result.listener_fd = -create_rc;
+        result.child_pid = -1;
+    } else {
+        pthread_join(thread, nullptr);
+    }
+
+    const jint values[4] = {result.listener_fd, result.child_pid, result.result_read_fd, result.go_write_fd};
+    jintArray output = env->NewIntArray(4);
+    if (output == nullptr) {
+        return nullptr;
+    }
+    env->SetIntArrayRegion(output, 0, 4, values);
+    return output;
+}
+
+extern "C" JNIEXPORT jintArray JNICALL
+Java_com_example_seccomp_demoapp_NativeSeccompBridge_installFilterForkAndExec(
+        JNIEnv* env, jclass, jstring executable_path_j, jobjectArray argv_j, jstring outcome_label_j) {
+    std::vector<std::string> argv;
+    if (argv_j != nullptr) {
+        const jsize argc = env->GetArrayLength(argv_j);
+        argv.reserve(static_cast<size_t>(argc));
+        for (jsize i = 0; i < argc; ++i) {
+            auto arg_j = static_cast<jstring>(env->GetObjectArrayElement(argv_j, i));
+            argv.push_back(CopyJString(env, arg_j, ""));
+            if (arg_j != nullptr) {
+                env->DeleteLocalRef(arg_j);
+            }
+        }
+    }
+
+    WorkerResult result;
+    WorkerArgs args{
+        .operation_kind = WorkerArgs::OperationKind::kExec,
+        .file_path = CopyJString(env, executable_path_j, ""),
+        .argv = std::move(argv),
+        .outcome_label = CopyJString(env, outcome_label_j, "Program execution"),
         .result = &result,
     };
 

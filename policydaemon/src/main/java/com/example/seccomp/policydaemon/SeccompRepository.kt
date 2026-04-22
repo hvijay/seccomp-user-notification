@@ -1,5 +1,6 @@
 package com.example.seccomp.policydaemon
 
+import android.app.ActivityManager
 import android.content.Context
 import android.os.ParcelFileDescriptor
 import android.util.Log
@@ -13,6 +14,7 @@ object SeccompRepository {
 
     private val sessionDescriptions = linkedMapOf<String, String>()
     private val sessionTargetPids = linkedMapOf<String, Int>()
+    private val sessionCallerPackages = linkedMapOf<String, String>()
     private val pendingRequests = linkedMapOf<String, PendingRequest>()
     private val decisions = linkedMapOf<String, DecisionState>()
 
@@ -24,7 +26,13 @@ object SeccompRepository {
     }
 
     @Synchronized
-    fun registerSession(sessionId: String, fd: Int, description: String, targetPid: Int): Boolean {
+    fun registerSession(
+        sessionId: String,
+        fd: Int,
+        description: String,
+        targetPid: Int,
+        callerPackage: String,
+    ): Boolean {
         if (!::appContext.isInitialized) {
             return false
         }
@@ -39,7 +47,8 @@ object SeccompRepository {
         }
         sessionDescriptions[sessionId] = description
         sessionTargetPids[sessionId] = targetPid
-        publish("Listening for Binder seccomp notifications from pid=$targetPid. Active sessions=${sessionDescriptions.size}")
+        sessionCallerPackages[sessionId] = callerPackage
+        publish("Listening for seccomp notifications from pid=$targetPid. Active sessions=${sessionDescriptions.size}")
         return true
     }
 
@@ -48,6 +57,7 @@ object SeccompRepository {
         SeccompNativeBridge.nativeStopListener(sessionId)
         sessionDescriptions.remove(sessionId)
         sessionTargetPids.remove(sessionId)
+        sessionCallerPackages.remove(sessionId)
         pendingRequests.entries.removeAll { it.value.sessionId == sessionId }
         decisions.keys.removeAll { it.startsWith("$sessionId:") }
         publish("Session removed: $sessionId")
@@ -105,6 +115,7 @@ object SeccompRepository {
         sessionDescriptions.keys.toList().forEach { SeccompNativeBridge.nativeStopListener(it) }
         sessionDescriptions.clear()
         sessionTargetPids.clear()
+        sessionCallerPackages.clear()
         pendingRequests.clear()
         decisions.clear()
     }
@@ -116,29 +127,34 @@ object SeccompRepository {
             val targetPid = sessionTargetPids[sessionId] ?: -1
             val raw = SeccompNativeBridge.nativeGetPendingRequest(sessionId) ?: return@forEach
 
-            // Indices 0-6 are String transport metadata; 7 is byte[] parcel; 8 is String byte count.
+            // Indices 0-12 are String metadata; 13 is byte[] parcel; 14 is String byte count.
             fun strOrNull(idx: Int): String? = raw.getOrNull(idx) as? String
 
             // notification_id is uint64; parse via ULong to avoid overflow on high-bit values.
             val notificationId = strOrNull(0)?.toULongOrNull()?.toLong() ?: return@forEach
             val pid = strOrNull(1)?.toIntOrNull() ?: return@forEach
             val syscallNr = strOrNull(2)?.toIntOrNull() ?: return@forEach
-            val ioctlCmd = strOrNull(3)?.toLongOrNull() ?: return@forEach
-            val binderCode = strOrNull(4)?.toIntOrNull() ?: 0
-            val targetHandle = strOrNull(5)?.toIntOrNull() ?: 0
-            val parcelTruncated = strOrNull(6)?.toBooleanStrictOrNull() ?: false
-            val parcelBytes = raw.getOrNull(7) as? ByteArray
-            val capturedBytes = strOrNull(8)?.toIntOrNull() ?: 0
+            val operationKind = strOrNull(3)?.toIntOrNull() ?: OP_KIND_UNKNOWN
+            val ioctlCmd = strOrNull(4)?.toLongOrNull() ?: 0L
+            val binderCode = strOrNull(5)?.toIntOrNull() ?: 0
+            val targetHandle = strOrNull(6)?.toIntOrNull() ?: 0
+            val parcelTruncated = strOrNull(7)?.toBooleanStrictOrNull() ?: false
+            val openFlags = strOrNull(8)?.toIntOrNull() ?: 0
+            val openMode = strOrNull(9)?.toIntOrNull() ?: 0
+            val filePath = strOrNull(10).orEmpty()
+            val execArgv = strOrNull(11).orEmpty()
+            val parcelBytes = raw.getOrNull(13) as? ByteArray
+            val capturedBytes = strOrNull(14)?.toIntOrNull() ?: 0
 
             // Decode exclusively in policydaemon with android.os.Parcel.
-            val parsedCall = parcelBytes?.let {
+            val parsedCall = if (operationKind == OP_KIND_BINDER) parcelBytes?.let {
                 BinderParcelDecoder.decode(
                     rawParcel = it,
                     capturedBytes = capturedBytes,
                     txnCode = binderCode,
                     truncated = parcelTruncated,
                 )
-            }
+            } else null
             if (parsedCall != null) {
                 Log.d(
                     TAG,
@@ -151,22 +167,35 @@ object SeccompRepository {
             val parsedUri = parsedCall?.args
                 ?.filterIsInstance<BinderArg.UriValue>()
                 ?.firstOrNull()?.value
+            val callingPackage = sessionCallerPackages[sessionId]
+                ?: resolveCallingPackage(pid)
+                ?: parsedCall?.args
+                    ?.filterIsInstance<BinderArg.StringValue>()
+                    ?.firstOrNull { it.name == "callingPackage" || it.name == "callingPkg" }
+                    ?.value
+                .orEmpty()
             val key = "$sessionId:$notificationId"
             refreshed[key] = PendingRequest(
                 sessionId = sessionId,
                 notificationId = notificationId,
                 pid = pid,
                 syscallNr = syscallNr,
+                operationKind = operationKind,
                 description = description,
                 ioctlCmd = ioctlCmd,
                 targetPid = targetPid,
                 cgroupPath = "",
                 monitorStatus = "seccomp user-notify",
+                callingPackage = callingPackage,
                 binderInterface = parsedCall?.interfaceDescriptor.orEmpty(),
                 binderCode = binderCode,
                 targetHandle = targetHandle,
                 intentAction = parsedIntent?.action.orEmpty(),
                 intentUri = (parsedIntent?.data ?: parsedUri)?.toString().orEmpty(),
+                filePath = filePath,
+                execArgv = execArgv,
+                openFlags = openFlags,
+                openMode = openMode,
                 parcelTruncated = parcelTruncated,
                 parsedCall = parsedCall,
             )
@@ -175,13 +204,24 @@ object SeccompRepository {
             pendingRequests.clear()
             pendingRequests.putAll(refreshed)
             val status = if (pendingRequests.isEmpty()) {
-                "Listening for Binder seccomp notifications. Active sessions=${sessionDescriptions.size}"
+                "Listening for seccomp notifications. Active sessions=${sessionDescriptions.size}"
             } else {
                 val first = pendingRequests.values.first()
-                "Pending Binder request from tid=${first.pid} (target pid=${first.targetPid}). Tap allow or deny."
+                val kind = when (first.operationKind) {
+                    OP_KIND_FILE_OPEN -> "file operation"
+                    OP_KIND_EXEC -> "program execution"
+                    else -> "Binder request"
+                }
+                "Pending $kind from tid=${first.pid} (target pid=${first.targetPid}). Tap allow or deny."
             }
             publish(status)
         }
+    }
+
+    private fun resolveCallingPackage(pid: Int): String? {
+        val am = appContext.getSystemService(ActivityManager::class.java) ?: return null
+        val process = am.runningAppProcesses?.firstOrNull { it.pid == pid } ?: return null
+        return process.pkgList?.firstOrNull() ?: process.processName
     }
 
     @Synchronized

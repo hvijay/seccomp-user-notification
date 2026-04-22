@@ -11,9 +11,8 @@ object SeccompNativeBridge {
         listenerFd: Int,
     ): Boolean
 
-    // Returns Object[9]: indices 0-6 are String transport metadata, 7 is
-    // ByteArray of raw parcel data (may be null if nothing was captured), and
-    // 8 is String with the captured byte count.
+    // Returns Object[15]: transport metadata, optional raw parcel bytes, and
+    // syscall-specific details for openat/execve-like operations.
     external fun nativeGetPendingRequest(
         sessionId: String,
     ): Array<Any?>?

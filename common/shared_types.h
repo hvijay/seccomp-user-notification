@@ -4,6 +4,14 @@
 #include <linux/types.h>
 
 #define PARCEL_CAPTURE_SIZE 1024
+#define MAX_PATH_LEN 256
+
+#define OP_KIND_UNKNOWN 0
+#define OP_KIND_BINDER 1
+#define OP_KIND_FILE_OPEN 2
+#define OP_KIND_EXEC 3
+
+#define MAX_ARGV_SUMMARY_LEN 512
 /*
  * Proxy socket protocol (policydaemon -> loader daemon).
  *
@@ -61,7 +69,12 @@ struct proxy_pending_request {
     __u64 notification_id;
     __u32 pid;
     __u32 syscall_nr;
+    __u32 operation_kind;
     __u64 ioctl_cmd;
+    __u32 open_flags;
+    __u32 open_mode;
+    char file_path[MAX_PATH_LEN];
+    char exec_argv[MAX_ARGV_SUMMARY_LEN];
     struct binder_txn_info txn;
 };
 
