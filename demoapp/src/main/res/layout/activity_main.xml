@@ -142,66 +142,82 @@
             android:textSize="13sp"
             android:textStyle="bold" />
 
-        <TextView
-            android:layout_width="wrap_content"
+        <LinearLayout
+            android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="12dp"
-            android:text="Demo of Android IPC interception"
-            android:textColor="#6B9FD4"
-            android:textSize="12sp"
-            android:textStyle="italic" />
+            android:background="#0B1724"
+            android:orientation="vertical"
+            android:padding="12dp">
 
-        <Button
-            android:id="@+id/calendarActionButton"
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Demo of Android IPC interception"
+                android:textColor="#6B9FD4"
+                android:textSize="12sp"
+                android:textStyle="italic" />
+
+            <Button
+                android:id="@+id/calendarActionButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:backgroundTint="#172842"
+                android:enabled="false"
+                android:text="Print my calendar"
+                android:textAllCaps="false"
+                android:textColor="#F4F7FB" />
+
+            <Button
+                android:id="@+id/browserActionButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:backgroundTint="#172842"
+                android:enabled="false"
+                android:text="Open the browser"
+                android:textAllCaps="false"
+                android:textColor="#F4F7FB" />
+        </LinearLayout>
+
+        <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="6dp"
-            android:backgroundTint="#172842"
-            android:enabled="false"
-            android:text="Print my calendar"
-            android:textAllCaps="false"
-            android:textColor="#F4F7FB" />
+            android:layout_marginTop="10dp"
+            android:background="#0B1724"
+            android:orientation="vertical"
+            android:padding="12dp">
 
-        <Button
-            android:id="@+id/browserActionButton"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="8dp"
-            android:backgroundTint="#172842"
-            android:enabled="false"
-            android:text="Open the browser"
-            android:textAllCaps="false"
-            android:textColor="#F4F7FB" />
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Demo of File operation interception"
+                android:textColor="#6B9FD4"
+                android:textSize="12sp"
+                android:textStyle="italic" />
 
-        <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="14dp"
-            android:text="Demo of File operation interception"
-            android:textColor="#6B9FD4"
-            android:textSize="12sp"
-            android:textStyle="italic" />
+            <Button
+                android:id="@+id/readContextActionButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:backgroundTint="#172842"
+                android:enabled="false"
+                android:text="Read workspace file CONTEXT.md"
+                android:textAllCaps="false"
+                android:textColor="#F4F7FB" />
 
-        <Button
-            android:id="@+id/readContextActionButton"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="6dp"
-            android:backgroundTint="#172842"
-            android:enabled="false"
-            android:text="Read workspace file CONTEXT.md"
-            android:textAllCaps="false"
-            android:textColor="#F4F7FB" />
-
-        <Button
-            android:id="@+id/execCurlActionButton"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="8dp"
-            android:backgroundTint="#172842"
-            android:enabled="false"
-            android:text="Execute web search tool (curl)"
-            android:textAllCaps="false"
-            android:textColor="#F4F7FB" />
+            <Button
+                android:id="@+id/execCurlActionButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:backgroundTint="#172842"
+                android:enabled="false"
+                android:text="Execute web search tool (curl)"
+                android:textAllCaps="false"
+                android:textColor="#F4F7FB" />
+        </LinearLayout>
     </LinearLayout>
 </LinearLayout>
