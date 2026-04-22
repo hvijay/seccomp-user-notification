@@ -252,7 +252,7 @@ class MainActivity : AppCompatActivity() {
         updateActionButtons()
 
         if (outcome.contains("denied", ignoreCase = true)) {
-            addAssistantMessage("${action.prompt} was denied.")
+            addAssistantMessage("${action.prompt} failed.")
             return
         }
 
