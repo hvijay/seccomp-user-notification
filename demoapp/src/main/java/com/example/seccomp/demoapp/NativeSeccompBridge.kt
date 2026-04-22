@@ -5,11 +5,10 @@ object NativeSeccompBridge {
         System.loadLibrary("seccomp_demo")
     }
 
-    external fun installFilterForkAndTriggerIntent(
-        action: String,
-        targetPackage: String,
-        targetComponent: String,
-        dataUri: String,
+    external fun installFilterForkAndTriggerTransaction(
+        transactionCode: Int,
+        rawParcel: ByteArray,
+        outcomeLabel: String,
     ): IntArray
 
     external fun readChildResult(readFd: Int): String

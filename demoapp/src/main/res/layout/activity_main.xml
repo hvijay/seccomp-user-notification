@@ -1,65 +1,178 @@
 <?xml version="1.0" encoding="utf-8"?>
-<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
-    android:layout_height="match_parent">
+    android:layout_height="match_parent"
+    android:background="#09111E"
+    android:orientation="vertical"
+    android:padding="16dp">
 
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:orientation="vertical"
-        android:padding="20dp">
+        android:background="#111D31"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:padding="16dp">
 
-        <TextView
-            android:layout_width="match_parent"
+        <LinearLayout
+            android:layout_width="0dp"
             android:layout_height="wrap_content"
-            android:text="Installs a seccomp user-notify filter for ioctl(BINDER_WRITE_READ), forks a child, and has the child issue a raw IContentProvider.query() to content://com.android.calendar/events so the policy daemon can inspect and allow or deny the Binder transaction."
-            android:textAppearance="?attr/textAppearanceBodyLarge" />
+            android:layout_weight="1"
+            android:orientation="vertical">
 
-        <TextView
-            android:id="@+id/eventsLabel"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="20dp"
-            android:text="Upcoming events (content://com.android.calendar/events):"
-            android:textAppearance="?attr/textAppearanceLabelMedium" />
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Atlas Agent"
+                android:textColor="#F4F7FB"
+                android:textSize="28sp"
+                android:textStyle="bold" />
 
-        <TextView
-            android:id="@+id/eventsText"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="4dp"
-            android:fontFamily="monospace"
-            android:text="Loading…"
-            android:textAppearance="?attr/textAppearanceBodySmall" />
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:text="Ask for a hardcoded action and wait for policy approval."
+                android:textColor="#A8BBCE"
+                android:textSize="14sp" />
+        </LinearLayout>
 
-        <Button
-            android:id="@+id/openDaemonButton"
-            android:layout_width="match_parent"
+        <LinearLayout
+            android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_marginTop="20dp"
-            android:text="Open policy daemon app" />
+            android:gravity="end"
+            android:orientation="vertical">
 
-        <Button
-            android:id="@+id/bindDaemonButton"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="12dp"
-            android:text="Bind daemon" />
+            <Button
+                android:id="@+id/openDaemonButton"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:backgroundTint="#26364F"
+                android:text="Open Policy"
+                android:textAllCaps="false"
+                android:textColor="#F4F7FB" />
 
-        <Button
-            android:id="@+id/startDemoButton"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="12dp"
-            android:enabled="false"
-            android:text="Intercept calendar query (install filter + fork)" />
-
-        <TextView
-            android:id="@+id/statusText"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="20dp"
-            android:text="Daemon not bound."
-            android:textAppearance="?attr/textAppearanceBodyMedium" />
+            <Button
+                android:id="@+id/bindDaemonButton"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:backgroundTint="#1D8F6B"
+                android:text="Reconnect"
+                android:textAllCaps="false"
+                android:textColor="#F4F7FB" />
+        </LinearLayout>
     </LinearLayout>
-</ScrollView>
+
+    <TextView
+        android:id="@+id/connectionStatusText"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:background="#12263D"
+        android:paddingLeft="12dp"
+        android:paddingTop="8dp"
+        android:paddingRight="12dp"
+        android:paddingBottom="8dp"
+        android:text="Waiting for policy daemon"
+        android:textColor="#FFB84D"
+        android:textSize="13sp"
+        android:textStyle="bold" />
+
+    <androidx.core.widget.NestedScrollView
+        android:id="@+id/chatScroll"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_marginTop="14dp"
+        android:layout_weight="1"
+        android:clipToPadding="false"
+        android:paddingBottom="8dp">
+
+        <LinearLayout
+            android:id="@+id/chatContainer"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical" />
+    </androidx.core.widget.NestedScrollView>
+
+    <LinearLayout
+        android:id="@+id/responseCard"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="10dp"
+        android:background="#111D31"
+        android:orientation="vertical"
+        android:padding="14dp"
+        android:visibility="gone">
+
+        <TextView
+            android:id="@+id/responseTitleText"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Response"
+            android:textColor="#9FE870"
+            android:textSize="14sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/responseText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:background="#0C1525"
+            android:fontFamily="monospace"
+            android:padding="12dp"
+            android:textColor="#E8F1FF"
+            android:textSize="13sp" />
+    </LinearLayout>
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="14dp"
+        android:background="#111D31"
+        android:orientation="vertical"
+        android:padding="14dp">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Suggested actions"
+            android:textColor="#A8BBCE"
+            android:textSize="13sp"
+            android:textStyle="bold" />
+
+        <Button
+            android:id="@+id/calendarActionButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:backgroundTint="#172842"
+            android:enabled="false"
+            android:text="Print my calendar"
+            android:textAllCaps="false"
+            android:textColor="#F4F7FB" />
+
+        <Button
+            android:id="@+id/browserActionButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:backgroundTint="#172842"
+            android:enabled="false"
+            android:text="Open the browser"
+            android:textAllCaps="false"
+            android:textColor="#F4F7FB" />
+
+        <Button
+            android:id="@+id/emailActionButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:backgroundTint="#172842"
+            android:enabled="false"
+            android:text="Send an email"
+            android:textAllCaps="false"
+            android:textColor="#F4F7FB" />
+    </LinearLayout>
+</LinearLayout>

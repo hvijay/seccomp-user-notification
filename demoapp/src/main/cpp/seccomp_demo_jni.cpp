@@ -20,6 +20,7 @@
 
 #include <array>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -41,10 +42,9 @@ struct WorkerResult {
 };
 
 struct WorkerArgs {
-    std::string action;
-    std::string target_package;
-    std::string target_component;
-    std::string data_uri;
+    uint32_t transaction_code = 0;
+    std::vector<uint8_t> raw_parcel;
+    std::string outcome_label;
     int go_read_fd = -1;
     WorkerResult* result;
 };
@@ -148,48 +148,7 @@ int ReceiveListenerFd(int sock_fd, int* out_status) {
     return -1;
 }
 
-/*
- * Write a 4-byte little-endian uint32 into buf at offset off; return new offset.
- */
-static uint32_t ParcelWriteU32(uint8_t* buf, uint32_t off, uint32_t val) {
-    memcpy(buf + off, &val, 4);
-    return off + 4;
-}
-
-/*
- * Write an Android String16 (Parcel format) into buf.
- * Null/empty string is written as length=-1 (0xFFFFFFFF).
- * Non-empty strings are length(u32) + UTF-16LE chars + 4-byte alignment pad.
- */
-static uint32_t ParcelWriteStr16(uint8_t* buf, uint32_t off, const char* s) {
-    if (!s || !s[0]) {
-        return ParcelWriteU32(buf, off, static_cast<uint32_t>(-1));
-    }
-    uint32_t len = static_cast<uint32_t>(strlen(s));
-    off = ParcelWriteU32(buf, off, len);
-    for (uint32_t i = 0; i < len; ++i) {
-        buf[off + i * 2]     = static_cast<uint8_t>(s[i]);
-        buf[off + i * 2 + 1] = 0;
-    }
-    off += len * 2;
-    buf[off++] = 0;  /* UTF-16 null terminator low byte */
-    buf[off++] = 0;  /* UTF-16 null terminator high byte */
-    while (off % 4 != 0) buf[off++] = 0;
-    return off;
-}
-
-/*
- * Instead of exec-ing `am start` (which fails because the forked child has the
- * app UID but am identifies itself as com.android.shell), build a raw Binder
- * BC_TRANSACTION directly on a fresh /dev/binder fd.
- *
- * The parcel is crafted to match what the eBPF monitor expects:
- *   strict_mode(u32) | work_source_uid(u32) | interface(str16)
- *   | action(str16) | uri(str16) | pkg(str16)
- *
- * seccomp intercepts the BINDER_WRITE_READ ioctl, eBPF captures the parcel,
- * and the policydaemon shows the allow/deny prompt.
- */
+/* Build a raw Binder BC_TRANSACTION directly on a fresh /dev/binder fd. */
 [[noreturn]] void DoBinderTransaction(const WorkerArgs& args, int write_fd) {
     /* Keep output on the result pipe so Kotlin can read it. */
     TEMP_FAILURE_RETRY(dup2(write_fd, STDOUT_FILENO));
@@ -230,34 +189,17 @@ static uint32_t ParcelWriteStr16(uint8_t* buf, uint32_t off, const char* s) {
     uint32_t max_threads = 0;
     ioctl(bfd, BINDER_SET_MAX_THREADS, &max_threads);
 
-    /* Build an IContentProvider.query() Parcel for content://com.android.calendar/events.
-     *
-     * Header:  strict_mode(u32) | work_source_uid(u32) | interface(str16)
-     * Params:  callingPkg(str16) | callingFeatureId(null str16, API 30+)
-     *        | Uri: int32(3=HierarchicalUri) | scheme(str16)
-     *               | authority Part: int32(1=ENCODED) str16
-     *               | path Part:      int32(1=ENCODED) str16
-     *               | query Part:     int32(-1=null)
-     *               | fragment Part:  int32(-1=null)
-     */
-    uint8_t parcel[1024] = {};
-    uint32_t poff = 0;
-    poff = ParcelWriteU32(parcel, poff, 0);        /* strict_mode */
-    poff = ParcelWriteU32(parcel, poff, ~0u);       /* work_source_uid */
-    poff = ParcelWriteStr16(parcel, poff, "android.content.IContentProvider");
-    poff = ParcelWriteStr16(parcel, poff, "com.example.seccomp.demoapp"); /* callingPkg */
-    poff = ParcelWriteU32(parcel, poff, static_cast<uint32_t>(-1));       /* callingFeatureId null */
-    /* Uri: StringUri (type=1) — single UTF-16 string, unambiguous for Parcel readers. */
-    poff = ParcelWriteU32(parcel, poff, 1);
-    poff = ParcelWriteStr16(parcel, poff, "content://com.android.calendar/events");
+    if (args.raw_parcel.empty()) {
+        dprintf(STDERR_FILENO, "raw parcel is empty\n");
+        _exit(1);
+    }
 
-    /* binder_transaction_data: TF_ONE_WAY so no reply is expected. */
     struct binder_transaction_data txn = {};
     txn.target.handle         = 1;   /* any registered service handle */
-    txn.code                  = 1;   /* TRANSACTION_query */
+    txn.code                  = args.transaction_code;
     txn.flags                 = TF_ONE_WAY;
-    txn.data_size             = poff;
-    txn.data.ptr.buffer       = reinterpret_cast<binder_uintptr_t>(parcel);
+    txn.data_size             = static_cast<binder_size_t>(args.raw_parcel.size());
+    txn.data.ptr.buffer       = reinterpret_cast<binder_uintptr_t>(args.raw_parcel.data());
     txn.offsets_size          = 0;
     txn.data.ptr.offsets      = 0;
 
@@ -283,10 +225,10 @@ static uint32_t ParcelWriteStr16(uint8_t* buf, uint32_t off, const char* s) {
      */
     int rc = ioctl(bfd, BINDER_WRITE_READ, &bwr);
 
-    static const char kAllowed[] = "Calendar query ioctl submitted (seccomp allowed).\n";
-    static const char kDenied[]  = "Calendar query ioctl denied by policy.\n";
-    const char* msg = (rc == 0 || errno != EPERM) ? kAllowed : kDenied;
-    TEMP_FAILURE_RETRY(write(STDOUT_FILENO, msg, strlen(msg)));
+    dprintf(STDOUT_FILENO,
+            "%s ioctl %s.\n",
+            args.outcome_label.c_str(),
+            (rc == 0 || errno != EPERM) ? "submitted (seccomp allowed)" : "denied by policy");
     close(bfd);
     _exit(0);
 }
@@ -382,15 +324,24 @@ std::string CopyJString(JNIEnv* env, jstring value, const char* fallback) {
 }  // namespace
 
 extern "C" JNIEXPORT jintArray JNICALL
-Java_com_example_seccomp_demoapp_NativeSeccompBridge_installFilterForkAndTriggerIntent(
-        JNIEnv* env, jclass, jstring action_j, jstring target_package_j,
-        jstring target_component_j, jstring data_uri_j) {
+Java_com_example_seccomp_demoapp_NativeSeccompBridge_installFilterForkAndTriggerTransaction(
+        JNIEnv* env, jclass, jint transaction_code, jbyteArray raw_parcel_j,
+        jstring outcome_label_j) {
+    std::vector<uint8_t> raw_parcel;
+    if (raw_parcel_j != nullptr) {
+        const jsize len = env->GetArrayLength(raw_parcel_j);
+        if (len > 0) {
+            raw_parcel.resize(static_cast<size_t>(len));
+            env->GetByteArrayRegion(raw_parcel_j, 0, len,
+                                    reinterpret_cast<jbyte*>(raw_parcel.data()));
+        }
+    }
+
     WorkerResult result;
     WorkerArgs args{
-        .action = CopyJString(env, action_j, "android.intent.action.VIEW"),
-        .target_package = CopyJString(env, target_package_j, ""),
-        .target_component = CopyJString(env, target_component_j, ""),
-        .data_uri = CopyJString(env, data_uri_j, "https://example.com/"),
+        .transaction_code = static_cast<uint32_t>(transaction_code),
+        .raw_parcel = std::move(raw_parcel),
+        .outcome_label = CopyJString(env, outcome_label_j, "Binder transaction"),
         .result = &result,
     };
 

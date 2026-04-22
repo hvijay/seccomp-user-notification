@@ -139,7 +139,7 @@ object BinderParcelDecoder {
 
         "stopService" -> serviceIntent(p, "service")
 
-        else -> emptyList()
+        else -> tryStartActivityLike(p)
     }
 
     // ── IActivityTaskManager (API 29+) ────────────────────────────────────────
@@ -148,7 +148,7 @@ object BinderParcelDecoder {
         "startActivity", "startActivityAsUser",
         "startActivityWithConfig", "startActivityAsCaller" -> startActivity(p)
 
-        else -> emptyList()
+        else -> tryStartActivityLike(p)
     }
 
     // ── IContentProvider ──────────────────────────────────────────────────────
@@ -170,7 +170,20 @@ object BinderParcelDecoder {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             readString(p, "callingFeatureId")?.let(::add) ?: return@buildList
         }
-        readIntent(p, "intent")?.let(::add) ?: return@buildList
+        val intentArg = readIntent(p, "intent") ?: return@buildList
+        val intentValue = (intentArg as? BinderArg.IntentValue)?.intent ?: return@buildList
+        if (!isMeaningfulIntent(intentValue)) return@buildList
+        add(intentArg)
+    }
+
+    private fun tryStartActivityLike(p: Parcel): List<BinderArg> {
+        val start = p.dataPosition()
+        val parsed = runCatching { startActivity(p) }.getOrElse { emptyList() }
+        if (parsed.isNotEmpty()) {
+            return parsed
+        }
+        p.setDataPosition(start)
+        return emptyList()
     }
 
     private fun broadcastIntent(p: Parcel): List<BinderArg> = buildList {
@@ -209,14 +222,35 @@ object BinderParcelDecoder {
     private fun readString(p: Parcel, name: String): BinderArg? =
         runCatching { BinderArg.StringValue(name, p.readString()) }.getOrNull()
 
-    private fun readUri(p: Parcel, name: String): BinderArg? = runCatching {
+    private fun readUri(p: Parcel, name: String): BinderArg? {
+        val start = p.dataPosition()
+        p.setDataPosition(start)
+        val marker = runCatching { p.readInt() }.getOrNull()
+        p.setDataPosition(start)
+        if (marker == 0) {
+            p.readInt()
+            return BinderArg.UriValue(name, null)
+        }
+        if (marker == 1) {
+            p.readInt()
+            tryParseUri(p, name)?.let { parsed ->
+                if ((parsed as? BinderArg.UriValue)?.value != null) {
+                    return parsed
+                }
+            }
+            p.setDataPosition(start)
+        }
+        return tryParseUri(p, name)
+    }
+
+    private fun tryParseUri(p: Parcel, name: String): BinderArg? = runCatching {
         // Uri.CREATOR.createFromParcel internally uses readString8 on some Samsung ROMs,
-        // truncating UTF-16LE parcel data at the first null byte.  Read the type int
+        // truncating UTF-16LE parcel data at the first null byte. Read the type int
         // ourselves and use Uri.parse(readString()) for StringUri (type=1) so that
         // readString16 is called directly.
         when (p.readInt()) {
-            0 -> BinderArg.UriValue(name, null)  // NULL_TYPE_ID
-            1 -> BinderArg.UriValue(name, p.readString()?.let { Uri.parse(it) })  // StringUri
+            0 -> BinderArg.UriValue(name, null)
+            1 -> BinderArg.UriValue(name, p.readString()?.let { Uri.parse(it) })
             else -> {
                 p.setDataPosition(p.dataPosition() - 4)
                 BinderArg.UriValue(name, Uri.CREATOR.createFromParcel(p))
@@ -224,6 +258,33 @@ object BinderParcelDecoder {
         }
     }.getOrNull()
 
-    private fun readIntent(p: Parcel, name: String): BinderArg? =
-        runCatching { BinderArg.IntentValue(name, Intent.CREATOR.createFromParcel(p)) }.getOrNull()
+    private fun readIntent(p: Parcel, name: String): BinderArg? {
+        val start = p.dataPosition()
+        p.setDataPosition(start)
+        val marker = runCatching { p.readInt() }.getOrNull()
+        p.setDataPosition(start)
+        if (marker == 0) {
+            p.readInt()
+            return BinderArg.IntentValue(name, null)
+        }
+        if (marker == 1) {
+            p.readInt()
+            runCatching { Intent.CREATOR.createFromParcel(p) }
+                .getOrNull()
+                ?.takeIf(::isMeaningfulIntent)
+                ?.let { return BinderArg.IntentValue(name, it) }
+            p.setDataPosition(start)
+        }
+        return runCatching { Intent.CREATOR.createFromParcel(p) }
+            .getOrNull()
+            ?.let { BinderArg.IntentValue(name, it) }
+    }
+
+    private fun isMeaningfulIntent(intent: Intent): Boolean {
+        return intent.action != null ||
+            intent.data != null ||
+            intent.`package` != null ||
+            intent.component != null ||
+            !intent.categories.isNullOrEmpty()
+    }
 }

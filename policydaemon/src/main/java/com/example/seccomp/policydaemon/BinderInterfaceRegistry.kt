@@ -51,9 +51,12 @@ object BinderInterfaceRegistry {
     }
 
     private fun buildMap(interfaceDescriptor: String): Map<Int, String> {
+        hardcoded[interfaceDescriptor]?.let { known ->
+            return known
+        }
         val reflected = reflectMap(interfaceDescriptor)
         if (reflected.isNotEmpty()) return reflected
-        return hardcoded[interfaceDescriptor] ?: emptyMap()
+        return emptyMap()
     }
 
     private fun reflectMap(interfaceDescriptor: String): Map<Int, String> {

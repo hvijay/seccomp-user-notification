@@ -49,6 +49,8 @@ class PolicyDebugProvider : ContentProvider() {
                     "binder_code",
                     "intent_action",
                     "intent_uri",
+                    "parsed_summary",
+                    "parse_error",
                 ),
             ).apply {
                 snapshot.pendingRequests.forEach { request ->
@@ -61,6 +63,8 @@ class PolicyDebugProvider : ContentProvider() {
                             request.binderCode,
                             request.intentAction,
                             request.intentUri,
+                            request.parsedCall?.summary().orEmpty(),
+                            request.parsedCall?.parseError.orEmpty(),
                         ),
                     )
                 }

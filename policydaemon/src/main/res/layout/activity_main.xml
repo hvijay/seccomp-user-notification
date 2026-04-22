@@ -20,7 +20,7 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginTop="8dp"
-        android:text="Bind from the demo app, then review pending seccomp notifications here."
+        android:text="Only the caller, requested action, and warning are shown here."
         android:textAppearance="?attr/textAppearanceBodyMedium"
         android:textColor="#3CFF6B" />
 

@@ -2,11 +2,13 @@ package com.example.seccomp.policydaemon
 
 import android.content.Context
 import android.os.ParcelFileDescriptor
+import android.util.Log
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
 object SeccompRepository {
+    private const val TAG = "SeccompRepository"
     private lateinit var appContext: Context
 
     private val sessionDescriptions = linkedMapOf<String, String>()
@@ -135,6 +137,12 @@ object SeccompRepository {
                     capturedBytes = capturedBytes,
                     txnCode = binderCode,
                     truncated = parcelTruncated,
+                )
+            }
+            if (parsedCall != null) {
+                Log.d(
+                    TAG,
+                    "pending parsed summary=${parsedCall.summary()} parseError=${parsedCall.parseError}",
                 )
             }
             val parsedIntent = parsedCall?.args
