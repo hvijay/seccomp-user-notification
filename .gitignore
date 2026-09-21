@@ -1,10 +1,43 @@
-.codex
-.gradle/
-local.properties
-policydaemon.log
+# Local tools and IDE settings
+/.codex
+/.agents/
+/.claude/
+.idea/
+*.iml
+.vscode/
 
-**/build/
-**/.cxx/
-loader/out/
-kernel/*.bpf.o
-kernel/*.skel.h
+# Gradle and Android build outputs
+.gradle/
+.kotlin/
+build/
+.cxx/
+.externalNativeBuild/
+local.properties
+*.apk
+*.aab
+*.aar
+
+# Native build outputs
+/loader/out/
+cmake-build-*/
+*.o
+*.so
+*.a
+/kernel/*.skel.h
+
+# Local secrets and signing material
+.env
+.env.*
+!.env.example
+*.jks
+*.keystore
+keystore.properties
+
+# Logs, backups, and editor/OS temporary files
+*.log
+*.bak
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
